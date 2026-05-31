@@ -80,6 +80,7 @@ def run_e2e_batch(
     device,
     chunk_length: int,
     overlap_ratio: float,
+    pred_clamp: Optional[float] = None,
 ) -> np.ndarray:
     import torch
 
@@ -98,6 +99,12 @@ def run_e2e_batch(
     with torch.inference_mode():
         pred_chunk = model(x_chunk, c_chunk, time_bounds, mask=token_mask, valid_mask=valid_token)
     pred = trace_time_unchunk(pred_chunk.detach().cpu(), chunk_info)
+    if pred_clamp is not None:
+        # Optional hard clamp to normalized range before inverse scaling.
+        # When None (default), model outputs are passed through without
+        # truncation, preserving possible amplitude excursions beyond the
+        # training clipping threshold.
+        pred = pred.clamp(-float(pred_clamp), float(pred_clamp))
     return pred.numpy().astype(np.float32)
 
 
@@ -115,6 +122,9 @@ def run_queryctx_inference(
     logger=None,
     rank: int = 0,
     world_size: int = 1,
+    flush_callback=None,
+    flush_interval: int = 0,
+    pred_clamp: Optional[float] = None,
 ) -> Tuple[Dict, Dict, float, Dict[str, Any]]:
     import torch
 
@@ -129,6 +139,7 @@ def run_queryctx_inference(
         vis_path = Path(vis_dir)
         vis_path.mkdir(parents=True, exist_ok=True)
     vis_limit = vis_max if vis_max > 0 else float("inf")
+    _flush_count = 0
 
     all_indices = list(range(len(dataset)))
     if world_size > 1:
@@ -194,7 +205,7 @@ def run_queryctx_inference(
         return x_batch, c_batch, trace_mask, valid_mask, scales, meta_list
 
     def _flush():
-        nonlocal total_missing, total_traces, pred_sum, pred_count
+        nonlocal total_missing, total_traces, pred_sum, pred_count, _flush_count
         if not sample_buf:
             return
 
@@ -208,6 +219,7 @@ def run_queryctx_inference(
             device=device,
             chunk_length=chunk_length,
             overlap_ratio=overlap_ratio,
+            pred_clamp=pred_clamp,
         )
         pred = pred * scales[:, None, None]
 
@@ -241,6 +253,13 @@ def run_queryctx_inference(
                     add_prediction(pred_sum, pred_count, key, pred_b[j])
 
         sample_buf.clear()
+        _flush_count += 1
+        if (
+            flush_callback is not None
+            and flush_interval > 0
+            and _flush_count % flush_interval == 0
+        ):
+            flush_callback(pred_sum, pred_count, _flush_count)
 
     for idx in iterator:
         sample = dataset[idx]
@@ -256,6 +275,9 @@ def run_queryctx_inference(
             )
 
     _flush()
+
+    if flush_callback is not None and flush_interval > 0:
+        flush_callback(pred_sum, pred_count, _flush_count)
 
     if device.type == "cuda":
         torch.cuda.synchronize()

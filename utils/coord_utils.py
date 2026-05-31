@@ -295,6 +295,145 @@ def compute_rope_omega(
 
 
 # ---------------------------------------------------------------------------
+# RoPE frequency config builder (called by train.py / infer_cli.py)
+# ---------------------------------------------------------------------------
+
+
+def build_rope_frequency_config(
+    coord_stats: Dict[str, Any] = {},
+    coord_dim: int = 4,
+    n_freqs: int = 8,
+    mode: str = "default",
+    lambda_phys_x: Optional[float] = None,
+    lambda_phys_y: Optional[float] = None,
+    nyquist_safety: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Build RoPE frequency configuration dict (with omega_bands for the model).
+
+    *default* mode:
+        Returns omega_bands=None → model uses standard RoPE (max_coord=1000).
+
+    *physical* mode:
+        Computes base angular frequencies from physical grid steps and coord
+        range, builds ``omega_bands`` of shape ``(coord_dim, n_freqs)``.
+        When ``lambda_phys_x/y`` are None, auto-computes from grid_step_*
+        in coord_stats via Nyquist: lambda_min = 2 * grid_step.
+
+    Args:
+        coord_stats: dict with min/max and grid_step_* per axis.
+        coord_dim: number of coordinate dimensions (4 or 6).
+        n_freqs: number of frequency bands per coordinate dim.
+        mode: 'default' or 'physical'.
+        lambda_phys_x: physical wavelength for x-axis (sx, rx). None=auto.
+        lambda_phys_y: physical wavelength for y-axis (sy, ry). None=auto.
+        nyquist_safety: safety factor (higher = more conservative).
+
+    Returns:
+        dict with keys: rope_freq_mode, omega_bands (None | np.ndarray),
+        coord_dim, n_freqs, lambda_phys_x/y, omega_x/y, warnings.
+    """
+    result: Dict[str, Any] = {
+        "rope_freq_mode": mode,
+        "omega_bands": None,
+        "coord_dim": coord_dim,
+        "n_freqs": n_freqs,
+        "lambda_phys_x": None,
+        "lambda_phys_y": None,
+        "omega_x": None,
+        "omega_y": None,
+        "warnings": [],
+    }
+
+    if mode == "default":
+        return result
+
+    # ---- physical mode ----
+
+    # Resolve lambda from user value or auto-compute from grid steps
+    _resolve_lambda(result, coord_stats, "x", lambda_phys_x, nyquist_safety)
+    _resolve_lambda(result, coord_stats, "y", lambda_phys_y, nyquist_safety)
+
+    lam_x = result["lambda_phys_x"]
+    lam_y = result["lambda_phys_y"]
+    if lam_x is None or lam_y is None:
+        result["warnings"].append(
+            "lambda_phys_x/y could not be resolved; falling back to default mode."
+        )
+        result["rope_freq_mode"] = "default"
+        return result
+
+    # Compute L (physical coordinate range)
+    Lx = max(
+        coord_stats.get("sx_max", 0) - coord_stats.get("sx_min", 0),
+        coord_stats.get("rx_max", 0) - coord_stats.get("rx_min", 0),
+    )
+    Ly = max(
+        coord_stats.get("sy_max", 0) - coord_stats.get("sy_min", 0),
+        coord_stats.get("ry_max", 0) - coord_stats.get("ry_min", 0),
+    )
+    if Lx <= 0:
+        Lx = coord_stats.get("Lx", 1.0)
+    if Ly <= 0:
+        Ly = coord_stats.get("Ly", 1.0)
+    Lx = max(float(Lx), 1.0)
+    Ly = max(float(Ly), 1.0)
+
+    # Base angular frequencies (for normalized coords in [0, 1])
+    omega_x = math.pi * Lx / lam_x
+    omega_y = math.pi * Ly / lam_y
+    result["omega_x"] = omega_x
+    result["omega_y"] = omega_y
+    result["lambda_phys_x"] = lam_x
+    result["lambda_phys_y"] = lam_y
+
+    # Build omega_bands: (coord_dim, n_freqs)
+    # Each row follows geometric progression (same pattern as standard RoPE)
+    # but scaled by the physical base frequency.
+    part_dim = 2 * n_freqs  # each coord dim gets head_dim = part_dim
+    base: float = 10000.0
+    bands = np.zeros((int(coord_dim), int(n_freqs)), dtype=np.float64)
+
+    omegas = [omega_x, omega_y, omega_x, omega_y]  # sx, sy, rx, ry
+    if coord_dim >= 6:
+        omegas += [omega_x, omega_y]  # start_time, end_time
+
+    for i in range(int(coord_dim)):
+        o = omegas[i] if i < len(omegas) else omega_x
+        for j in range(int(n_freqs)):
+            bands[i, j] = o / (base ** (2.0 * j / part_dim))
+
+    result["omega_bands"] = bands
+    return result
+
+
+def _resolve_lambda(
+    result: Dict[str, Any],
+    coord_stats: Dict[str, Any],
+    axis: str,
+    user_value: Optional[float],
+    nyquist_safety: float,
+) -> None:
+    """Helper: fill result['lambda_phys_{axis}'] from user_value or coord_stats."""
+    key = f"lambda_phys_{axis}"
+    if user_value is not None and not (isinstance(user_value, float) and math.isnan(user_value)):
+        result[key] = float(user_value) * nyquist_safety
+        return
+
+    # Auto from grid steps
+    lambda_info = infer_lambda_phys_from_coord_stats(coord_stats)
+    auto_val = lambda_info.get(key)
+    if auto_val is not None and auto_val > 0:
+        result[key] = float(auto_val) * nyquist_safety
+    else:
+        result[key] = None
+        result["warnings"].append(
+            f"Cannot auto-compute {key} from grid steps; "
+            "provide it explicitly or fall back to default mode."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Unified config builder
 # ---------------------------------------------------------------------------
 

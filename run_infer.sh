@@ -15,7 +15,7 @@ NUM_GPUS="${NUM_GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-29502}"
 
 # ---- Model checkpoint ----
-CHECKPOINT="${CHECKPOINT:-/data/shared/测试数据/h5/model-20.pth}"
+CHECKPOINT="${CHECKPOINT:-/home/chengzhitong/5d_regular/Regformer_5d/resultsE2E_V2/e2e_v9_datatype_df_field1031_5d_queryctx/checkpoints/model-1650.pth}"
 
 # ---- Data ----
 H5_DIR="${H5_DIR:-/data/shared/测试数据/h5}"
@@ -24,23 +24,25 @@ H5_REGULAR="${H5_REGULAR:-${H5_DIR}/field1031_label.h5}"
 H5_MASK="${H5_MASK:-${H5_DIR}/field1031_mask.h5}"
 H5_TGT="${H5_TGT:-}"
 MASK_SEGY="${MASK_SEGY:-/data/shared/测试数据/mask_from_label.sgy}"
-DATASET_NEIGHBORS_INFER="${DATASET_NEIGHBORS_INFER:-${H5_DIR}/patchV4/infer_query_context.npz}"
-LABEL_SEGY="${LABEL_SEGY:-}"
+DATASET_NEIGHBORS_INFER="${DATASET_NEIGHBORS_INFER:-/data/shared/测试数据/h5/anchor_patch_e2ev1/infer_query_context.npz}"
+LABEL_SEGY="${LABEL_SEGY:-/data/shared/测试数据/reg_pku_1031/reg_pku_1030/reg5dbin_label1031.sgy}"
 
 # ---- Output ----
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/gen_fill_results_v2}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/gen_fill_results}"
 OUTPUT_SEGY="${OUTPUT_SEGY:-${OUTPUT_DIR}/filled_missing.sgy}"
 OUTPUT_RESIDUAL_SEGY="${OUTPUT_RESIDUAL_SEGY:-${OUTPUT_DIR}/residual.sgy}"
 
 # ---- Inference params ----
 DEVICE="${DEVICE:-cuda:0}"
-BATCH_SIZE="${BATCH_SIZE:-18}"
-TIME_PS="${TIME_PS:-1256}"
+BATCH_SIZE="${BATCH_SIZE:-156}"
+TIME_PS="${TIME_PS:-1251}"
 TRACE_PS="${TRACE_PS:-128}"
 HEADER_MODE="${HEADER_MODE:-fixed}"
 USE_P_SCALE="${USE_P_SCALE:-false}"
 CHUNK_LENGTH="${CHUNK_LENGTH:-256}"
 OVERLAP_RATIO="${OVERLAP_RATIO:-0.125}"
+FILL_INTERVAL="${FILL_INTERVAL:-0}"
+PRED_CLAMP="${PRED_CLAMP:-}"
 
 # ---- Model params (auto-overridden from checkpoint training_config when present) ----
 MODEL_TYPE="${MODEL_TYPE:-e2e_encdec_v9}"
@@ -54,7 +56,7 @@ LAMBDA_PHYS_Y="${LAMBDA_PHYS_Y:-auto}"
 ROPE_NYQUIST_SAFETY="${ROPE_NYQUIST_SAFETY:-1.0}"
 
 VISUALIZE="${VISUALIZE:-true}"
-VIS_BATCHES="${VIS_BATCHES:-0}"
+VIS_BATCHES="${VIS_BATCHES:-1}"
 SORT_SEGY="${SORT_SEGY:-true}"
 
 # ---- SEG-Y config preset ----
@@ -89,6 +91,7 @@ shared_args=(
   --lambda_phys_y "${LAMBDA_PHYS_Y}"
   --rope_nyquist_safety "${ROPE_NYQUIST_SAFETY}"
   --use_p_scale "${USE_P_SCALE}"
+  --fill_interval "${FILL_INTERVAL}"
   --visualize "${VISUALIZE}"
   --vis_batches "${VIS_BATCHES}"
   --sort_segy "${SORT_SEGY}"
@@ -100,6 +103,9 @@ if [[ -n "${LABEL_SEGY}" ]]; then
 fi
 if [[ -n "${H5_TGT}" ]]; then
   shared_args+=(--h5_tgt "${H5_TGT}")
+fi
+if [[ -n "${PRED_CLAMP}" ]]; then
+  shared_args+=(--pred_clamp "${PRED_CLAMP}")
 fi
 
 echo "============================================================"
@@ -119,6 +125,8 @@ echo "neighbors_npz: ${DATASET_NEIGHBORS_INFER}"
 echo "output_segy:   ${OUTPUT_SEGY}"
 echo "device:        ${DEVICE}"
 echo "batch_size:    ${BATCH_SIZE}"
+echo "fill_interval: ${FILL_INTERVAL}"
+echo "pred_clamp:    ${PRED_CLAMP:-<none>}"
 echo "model_type:    ${MODEL_TYPE}"
 echo "rope_freq:     ${ROPE_FREQ_MODE} (${LAMBDA_PHYS_X}/${LAMBDA_PHYS_Y})"
 echo "chunk_length:  ${CHUNK_LENGTH}"

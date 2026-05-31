@@ -72,8 +72,10 @@ class DatasetH5Interp:
         patch_metric_weights=None,
         force_anchor_query: bool = False,
         trace_sort_keys: Optional[Tuple[str, ...]] = None,
-        time_ps: int = 1256,
+        time_ps: int = 1251,
         trace_ps: int = 128,
+        dt_ms: int = 4,
+        t0_ms: int = 0,
     ):
         super().__init__()
         print("Loading DatasetH5Interp...")
@@ -95,8 +97,8 @@ class DatasetH5Interp:
             trace_sort_keys = get_trace_sort_keys()
         self.trace_sort_keys = tuple(trace_sort_keys)
 
-        self.dt_ms = 4
-        self.t0_ms = 0
+        self.dt_ms = dt_ms
+        self.t0_ms = t0_ms
 
         self.h5_data = self._load_h5_group(self.h5File)
         print(self.h5_data["data"].shape)

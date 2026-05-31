@@ -76,9 +76,12 @@ class DatasetH5_all_queryctx:
         force_anchor_query: bool = False,
         trace_sort_keys: Optional[Tuple[str, ...]] = None,
         use_p_scale: bool = False,
-        time_ps: int = 1256,
+        time_ps: int = 1251,
         trace_ps: int = 128,
         epoch_repeat: int = 1,
+        target_mode: str = "self",
+        dt_ms: int = 4,
+        t0_ms: int = 0,
     ):
         super().__init__()
         self.h5File = h5File
@@ -87,6 +90,7 @@ class DatasetH5_all_queryctx:
         self.time_ps = time_ps
         self.trace_ps = trace_ps
         self.train = train
+        self.target_mode = target_mode
         self._rng = np.random.default_rng(123)
         self.std_val = None
         self.train_num_query = int(max(1, train_num_query))
@@ -104,8 +108,8 @@ class DatasetH5_all_queryctx:
         self.trace_sort_keys = tuple(trace_sort_keys)
         self.use_p_scale = use_p_scale
 
-        self.dt_ms = 4
-        self.t0_ms = 0
+        self.dt_ms = dt_ms
+        self.t0_ms = t0_ms
         self.scale = None
 
         self.h5_data = self._load_h5_group(self.h5File)
@@ -585,12 +589,14 @@ class DatasetH5_all_queryctx:
         if self.patch_mode == "train_pool":
             return self._build_train_query_context_sample(idx)
 
-        if (not self.train) and self.patch_mode == "infer_query_context":
-            return self._build_infer_query_context_sample(idx)
+        if self.patch_mode == "infer_query_context":
+            # supervised 模式下，训练也使用推理的固定 patch（过拟合用）
+            if (not self.train) or self.target_mode == "supervised":
+                return self._build_infer_query_context_sample(idx)
 
         raise NotImplementedError(
             f"DatasetH5_all_queryctx: unsupported train={self.train!r}, "
-            f"patch_mode={self.patch_mode!r}"
+            f"patch_mode={self.patch_mode!r} target_mode={self.target_mode!r}"
         )
 
 

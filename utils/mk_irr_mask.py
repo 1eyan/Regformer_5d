@@ -1,342 +1,288 @@
+"""
+Generate irregular/mask/label data pairs from a single SEG-Y file for 5D training.
+Randomly drops receiver grid cells to simulate irregular sampling.
+
+Byte positions come from the active segy_config preset (not a standalone JSON).
+Select preset via env:  SEGY_CONFIG=a002  (or export before running).
+
+Outputs (per input file):
+  - {name}_new.sgy/h5          — label (full data, sorted)
+  - {name}_irr_{ratio}.sgy/h5  — irregular (kept traces only)
+  - {name}_mask_{ratio}.sgy/h5 — mask  (missing traces zeroed, headers kept)
+  - {name}_bool_mask_arr.npy   — boolean mask array
+  - {name}_shot_xy_cut.dat / {name}_rcvs_xy_cut.dat  — coordinate QC
+"""
+
 import os
-import numpy as np
-import seisio as sio
-import pandas as pd
+import json
+import tempfile
 import logging
-import pdb
+import sys
+import numpy as np
+import pandas as pd
 import h5py as h5
-#from pathlib import Path
+import seisio as sio
+
+# Ensure project root is on sys.path (so "from config import segy_config" works)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from config import segy_config
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s', force=True)
-log = logging.getLogger("main")
+log = logging.getLogger("mk_irr_mask")
 
-#complete write by xd, 20260508
+# ---------------------------------------------------------------------------
+# Configuration — set via env vars
+# ---------------------------------------------------------------------------
+INPUT_SGY = os.environ.get("INPUT_SGY", "")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "")
+MISSING_RATIO = float(os.environ.get("MISSING_RATIO", "0.3"))
+PRESET = os.environ.get("SEGY_CONFIG", "a002")  # must exist in segy_config.yaml
+MASK_DOMAIN = os.environ.get("MASK_DOMAIN", "receiver")  # receiver | shot | both | 4d
 
-output_type = 'segy'   # default output h5 data, or 'sgy' for segy output.
-
-def segy2h5(h5_file, data, group_name='1551', headers_df=None):
-    """
-    单个 SEG-Y 落盘到 H5，按 sort_keys 组织地震道。
-    """
-    with h5.File(h5_file, 'w', locking=False) as h5f:
-        g = h5f.create_group(group_name)
-        g.create_dataset('data', data=data, dtype='f',compression='gzip')
-        g.create_dataset('sx', data=headers_df['shot_x'], dtype='f',compression='gzip')
-        g.create_dataset('sy', data=headers_df['shot_y'], dtype='f',compression='gzip')
-        g.create_dataset('rx', data=headers_df['recv_x'], dtype='f',compression='gzip')
-        g.create_dataset('ry', data=headers_df['recv_y'], dtype='f',compression='gzip')
-        g.create_dataset('offset', data=headers_df['offset'],dtype='f', compression='gzip')
-        g.create_dataset('dt', data=headers_df['dt'], dtype='f',compression='gzip')
-        g.create_dataset('t0', data=headers_df['t0'],dtype='f', compression='gzip')
-        g.create_dataset('shot_line', data=headers_df['shot_line'], dtype='i',compression='gzip')
-        g.create_dataset('shot_no', data=headers_df['shot_no'], dtype='i',compression='gzip')
-        g.create_dataset('recv_line', data=headers_df['recv_line'], dtype='i',compression='gzip')
-        g.create_dataset('recv_no', data=headers_df['recv_no'], dtype='i',compression='gzip')
-        g.create_dataset('shot_stake', data=headers_df['shot_stake'], dtype='i',compression='gzip')
-        g.create_dataset('recv_stake', data=headers_df['recv_stake'], dtype='i',compression='gzip')
-        g.create_dataset('cmp', data=headers_df['cmp'], dtype='i',compression='gzip')
-        g.create_dataset('cmp_line', data=headers_df['cmp_line'],dtype='i', compression='gzip')
-        g.create_dataset('trace_idx', data=headers_df.index, dtype='q',compression='gzip')
+# Coordinate columns that need scalar correction
+COORD_COLS = ["shot_x", "shot_y", "recv_x", "recv_y"]
 
 
-def to_native_endian(df):
-    # Convert all numeric columns
+# ---------------------------------------------------------------------------
+# Build seisio thdef from segy_config
+# ---------------------------------------------------------------------------
 
-    # Convert ALL big-endian numeric columns (including unsigned ints)
-    for col in pdinfo.select_dtypes(include='number').columns:
-        if pdinfo[col].dtype.byteorder == '>':
-            pdinfo[col] = pdinfo[col].astype(pdinfo[col].dtype.newbyteorder('='))
-    #for col in df.select_dtypes(include=['int', 'float']).columns:
-    #    if df[col].dtype.byteorder == '>':
-    #        df[col] = df[col].astype(df[col].dtype.newbyteorder('='))
+def _build_thdef() -> dict:
+    """Build a seisio-compatible header definition dict from the active config."""
+    byte_pos = segy_config.get_byte_pos()
+    types = segy_config.get_thdef_types()
+    thdef = {}
+    for field, byte in byte_pos.items():
+        thdef[field] = {"byte": byte, "type": types.get(field, "i")}
+    return thdef
 
-    # Convert index (single or MultiIndex)
+
+# ---------------------------------------------------------------------------
+# I/O helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_native_endian(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert all big-endian numeric columns and index to native byte order."""
+    for col in df.select_dtypes(include="number").columns:
+        if df[col].dtype.byteorder == ">":
+            df[col] = df[col].astype(df[col].dtype.newbyteorder("="))
     idx = df.index
-    if hasattr(idx, 'dtype'):  # single index (Int64Index, etc.)
-        if idx.dtype.byteorder == '>':
-            df.index = idx.astype(idx.dtype.newbyteorder('='))
-    elif hasattr(idx, 'levels'):  # MultiIndex
+    if hasattr(idx, "dtype") and idx.dtype.byteorder == ">":
+        df.index = idx.astype(idx.dtype.newbyteorder("="))
+    elif hasattr(idx, "levels"):
         new_levels = []
         for level in idx.levels:
-            if level.dtype.byteorder == '>':
-                new_levels.append(level.astype(level.dtype.newbyteorder('=')))
+            if level.dtype.byteorder == ">":
+                new_levels.append(level.astype(level.dtype.newbyteorder("=")))
             else:
                 new_levels.append(level)
         df.index = pd.MultiIndex(levels=new_levels, codes=idx.codes)
     return df
 
-#datapath4="../004-sw06-Sj5-irr.sgy"
-#datapath5="../004-sw06-Sj5-mask.sgy"
-#datapath3="/hw6p/groupdata.new/procai/xd/reg5d_pku/test2604/train/004_sw13-label.sgy"
-#datapath3="/hw6p/groupdata.new/procai/xd/reg5d_pku/test2604/train/004_sw13-label"
-#datapath3="/hw6p/groupdata.new/procai/xd/reg5d_pku/test2604/004_sw09-select-4ms-filter.sgy"
 
-#by xd, 2026-05-11
-#Here for input segy label, and all other data, including mask, irr (h5 & segy) are all from
-#this segy data 
-#datapath3="/hw6p/groupdata.new/procai/xd/reg5d_pku/test2604/train/004_sw11-label.sgy"
-datapath3="/data/liuqi/code/MAE/5d-transformer/gated_v35/data/new/A002-train-part1.sgy"
-#output location, modified as your will
-out_path = "/data/liuqi/code/MAE/5d-transformer/gated_v35/data/new/train" #modified bg czt0511  #location for output data 
-os.makedirs(out_path,exist_ok=True)
-outmp = datapath3.split('/')[-1]
-outname=outmp.split('.')[0]
-print(f'The output file name is {outname}')
-segy_path=f'{out_path}{outname}-'
-outmp = os.path.join(out_path,'h5/')
-#outmp=os.makedirs(out_path+'h5/',exist_ok=True)
-os.makedirs(outmp,exist_ok=True)
-print(f'outmp = {outmp}')
-h5_path=f"{outmp}{outname}-"  # h5 filename
-print(f'segy_path = {segy_path},  h5_path={h5_path}')
+def _write_h5(h5_path: str, data: np.ndarray, headers_df: pd.DataFrame, group: str = "1551"):
+    """Write trace data + headers into an H5 file."""
+    with h5.File(h5_path, "w", locking=False) as h5f:
+        g = h5f.create_group(group)
+        g.create_dataset("data", data=data, dtype="f", compression="gzip")
+        for col in headers_df.columns:
+            g.create_dataset(col, data=headers_df[col].to_numpy(), dtype="f", compression="gzip")
+        g.create_dataset("trace_idx", data=headers_df.index.to_numpy(), dtype="q", compression="gzip")
 
 
-#Attention, by  xd, 2026-05-11
-#specifically for the 5D data,  2026-04-21, Tuesday.
-#If test other data, please do not use this customized header
-#jsons='./5ddata_header.json'   #for Zhaobiao data only
-#jsons='./inmodel_header.json'  #same with in2model_header.json
-jsons='/data/liuqi/code/MAE/5d-transformer/gated_v35/data/new/in2model_header.json'  #input model header, spedified for model data 
-#model_json = 'model_header.json'
-#outjson = 'model_header.json'
-jsons2='/data/liuqi/code/MAE/5d-transformer/gated_v35/data/new/in2model_header.json'  #same with in2model_header.json
-
-#sio_tmp = sio.input('testdata.su')
-#sio_tmp = sio.input('testdata.pp',filetype='SGY')  #used for other common dataset
-sio_tmp = sio.input(datapath3,filetype='SGY',thdef=jsons) # jsons customized for 5D header extraction
-
-#numpy contains all segy data and headers
-#good for small data, not for large data
-#dataset = sio_tmp.read_dataset() 
-headall = sio_tmp.read_all_headers()  #load all header for sorting 
-
-#print(f'headall  = {headall}')
-
-ntraces = sio_tmp.nt  # or sio.ntraces
-nsamples = sio_tmp.ns  # or sio.nsamples
-sampling_interval = sio_tmp.vsi   #dt
-
-print(f'ntraces,  nsamples,  sampling_interval = {ntraces, nsamples, sampling_interval} .')
-#
-thstat = sio_tmp.log_thstat(traces=headall)
-print(f'thstat  = {thstat}')
+def _write_segy(sgy_path: str, traces: np.ndarray, ns: int, vsi: float, thdef_path: str):
+    """Write a structured array of traces to a SEG-Y file."""
+    sout = sio.output(sgy_path, ns=ns, vsi=vsi, endian=">", txtenc="ebcdic", thdef=thdef_path)
+    sout.init()
+    nwritten = sout.write_traces(traces=traces)
+    log.info("Wrote %s — %d traces", sgy_path, nwritten)
+    sout.finalize()
 
 
-outhead = {}
-#outhead['trace']=list(range(ntraces))
-#outhead['trace_idx']=range(ntraces)
-outhead['shot_line']=headall['sp_line']
-outhead['shot_no']=headall['source_no']
-outhead['recv_line']=headall['gp_line']
-outhead['recv_no']=headall['trace_no']
-# 读取坐标信息
-#outhead['shot_stake']=headall['shot_stake']
-#outhead['recv_stake']=headall['recv_stake']
-outhead['shot_stake']=headall['sp_point']
-outhead['recv_stake']=headall['gp_point']
-outhead['cmp']=headall['cmp']
-outhead['cmp_line']=headall['cmp_line']
-outhead['offset']=headall['offset']
-#outhead['sx'] = headall['sx']
-#outhead['sy'] = headall['sy']
-#outhead['rx'] = headall['gx']
-#outhead['ry'] = headall['gy']
-outhead['shot_x'] = headall['sp_x']
-outhead['shot_y'] = headall['sp_y']
-outhead['recv_x'] = headall['gp_x']
-outhead['recv_y'] = headall['gp_y']
-outhead['t0'] = headall['delrt']
-outhead['dt'] = headall['dt']
-outhead['scalar']=headall['scalel']
-#outhead['delta']=headall['delta']
+# ---------------------------------------------------------------------------
+# Mask construction
+# ---------------------------------------------------------------------------
 
-pdinfo = pd.DataFrame.from_dict(outhead)
-pdinfo.index.name = 'trace_idx'
-
-pdinfo = to_native_endian(pdinfo)
-
-print("Index dtype:", pdinfo.index.dtype)
-print("Any big-endian columns?", any(pdinfo[col].dtype.byteorder == '>' for col in pdinfo.columns))
-
-big_cols = [col for col in pdinfo.columns if pdinfo[col].dtype.byteorder == '>']
-print("Still big-endian:", big_cols)   # Should be empty []
-
-print(pdinfo)
+def _grid_mask(headall: np.ndarray, line_key: str, stake_key: str,
+               ratio: float) -> np.ndarray:
+    """Build a 1D trace mask from a 2D (line, stake) grid."""
+    uniq_lines = np.unique(headall[line_key])
+    uniq_stakes = np.unique(headall[stake_key])
+    grid = np.random.random((len(uniq_lines), len(uniq_stakes))) < ratio
+    li = np.searchsorted(uniq_lines, headall[line_key])
+    si = np.searchsorted(uniq_stakes, headall[stake_key])
+    trace_mask = grid[li, si]
+    actual = 1.0 - trace_mask.mean()
+    log.info("  grid (%s, %s): %d lines × %d stakes, miss=%.4f",
+             line_key, stake_key, len(uniq_lines), len(uniq_stakes), actual)
+    return trace_mask
 
 
-big_endian_cols = [col for col in pdinfo.columns
-                   if pdinfo[col].dtype.byteorder == '>']
-print("Big-endian columns:", big_endian_cols)
-#for col in big_endian_cols:
-    # This swaps bytes and sets the dtype to native byte order
-#    pdinfo[col] = pdinfo[col].values.byteswap().newbyteorder('=')
+def _build_trace_mask(headall: np.ndarray, ratio: float, domain: str) -> np.ndarray:
+    """Build 1D trace mask according to domain strategy.
 
-# for col in big_endian_cols:
-#     arr = pdinfo[col].values                    # get the underlying NumPy array
-#     arr.byteswap(inplace=True)                  # swap the bytes in the original data
-#     pdinfo[col] = arr.view(arr.dtype.newbyteorder('='))  # reinterpret as native byte order
-
-for col in big_endian_cols:
-    # Target dtype: same type but with native byte order ('=')
-    native_dtype = pdinfo[col].dtype.newbyteorder('=')
-    pdinfo[col] = pdinfo[col].astype(native_dtype)
-#sort_keys = big_endian_cols  # your list of column names
-#for key in sort_keys:
-#    if pdinfo[key].dtype.byteorder == '>':
-#        pdinfo[key] = pdinfo[key].values.byteswap().newbyteorder('=')
-
-#scalar = pdinfo['scalar'][tmp_idx]
-#scalar[scalar == 0] = 1
-
-#pdinfo[['sx','sy','gx','gy']] = pdinfo[['sx','sy','gx','gy']].div(
-#    pdinfo['scalar'].replace(0,1).abs(), axis=0
-#)
-
-cols = ['shot_x', 'shot_y', 'recv_x', 'recv_y']
-scalar_safe = pdinfo['scalar'].replace(0, 1).abs()   # creates a writable Series
-pdinfo[cols] = pdinfo[cols].div(scalar_safe, axis=0)
-
-#sort_keys = ['recv_line', 'recv_stake', 'shot_line', 'shot_stake']
-sort_keys = ['shot_line', 'shot_stake','recv_line', 'recv_stake' ]
-pdinfo.sort_values(by=sort_keys,ascending=[True,True,True,True],na_position='last',inplace=True)
-#tmp_idx = pdinfo['trace_idx'].to_numpy(dtype=np.intp)
-tmp_idx = pdinfo.index.to_numpy(dtype=np.intp)
-
-#is_sorted = True
-#if tmp_idx != np.arange(ntraces):
-#    print(f'data not sorted,  now sorting and kept index, new index = {tmp_idx}.')
-#    is_sorted = False    #not sorted, now sorted again
-
-#pdinfo[['shot_x','shot_y','recv_x','recv_y']] /= abs(scalar)
-
-#by xd, 2026-05-05
-#headall = headall[tmp_idx]  #resort head sequence for later segy dumping
-
-group_fields = ['sp_line', 'sp_point']   # change as needed
-sio_tmp.create_index(group_by=group_fields, sort_by=['gp_line','gp_point'])
-#sio_tmp.create_index( group_by=['gp_line','gp_stake'], sort_by=['sp_line','sp_stake'])
-
-# %%
-nensembles = sio_tmp.nensembles        # number of ensembles, or sio.ne for short
-ntraces_per_ensemble = sio_tmp.nte     # vector containing number of traces per ensemble
-max_ntraces = sio_tmp.maxnte           # size (no. of traces) of largest ensemble
-ensemble_keys = sio_tmp.ensemble_keys  # keys to identify the different ensembles
-
-#log.info("Maximum number of traces within all the ensembles: %d", max_ntraces)
-#print(f'\nIndexing ... , {nensembles} gathers,  maximum {max_ntraces} traces of largest ensembles, and the ensemble_keys are {ensemble_keys}')
-
-#print(f'Finish creating  index now.')
-uniq_lines = np.unique(headall['gp_line'])
-nlins = len(uniq_lines)
-uniq_stakes = np.unique(headall['gp_point'])
-npnts = len(uniq_stakes)
-
-#print("Unique gp_line values:", uniq_lines, " total ",len(uniq_lines), " points.")
-#print("Unique gp_stake values:", uniq_stakes, " total ",len(uniq_stakes), "points.")
-
-# 2. Generate your 2D boolean mask (shape = len(lines) x len(stakes))
-#    For example, random mask:
-#mask = np.random.random((len(uniq_lines), len(uniq_stakes))) < 0.3   # 30% True
-
-#modify missing ratio here, by xd, 2026-05-11
-missing_perc=0.3
-
-#rand_array = np.random.rand(nlins, npnts)
-#quanti = np.quantile(rand_array,missing_perc)
-
-#del_stakes = np.random.permutation(uniq_stakes)[:int(npnts*0.5)]
-#del_stakes = np.where(rand_array < quanti)
-#mask = np.where(rand_array < quanti)
-mask = np.random.random((len(uniq_lines), len(uniq_stakes))) < missing_perc   # 30% True
-
-#load all data and sorted, by xd, 2026-05-11
-all_data = sio_tmp.read_all_traces()[tmp_idx]   # structured array, shape (n_traces,)
-
-# 3. Map each trace to indices (fast, O(n_traces * log(n_lines))
-line_idx = np.searchsorted(uniq_lines, all_data['gp_line'])
-stake_idx = np.searchsorted(uniq_stakes, all_data['gp_point'])
-
-# Ensure all values are found (should be, if lines/stakes cover all data)
-assert np.all(line_idx < len(uniq_lines)) and np.all(stake_idx < len(uniq_stakes))
-
-print(f"Uniq  lines: {uniq_lines},  points:   {uniq_stakes}")
-
-#final mask  is trace_mask
-# 2. Create a 1D boolean mask for the traces using the 2D mask
-trace_mask = mask[line_idx, stake_idx]   # shape = (n_traces,)
+    Parameters
+    ----------
+    domain : str
+        ``"receiver"`` — 2D grid on (recv_line, recv_stake)
+        ``"shot"``     — 2D grid on (shot_line, shot_stake)
+        ``"both"``     — independent 2D grids on receiver & shot, union
+        ``"4d"``       — 4D grid (shot_line, shot_stake, recv_line, recv_stake)
+    """
+    log.info("Mask domain=%s  target_ratio=%.2f", domain, ratio)
+    if domain == "receiver":
+        return _grid_mask(headall, "recv_line", "recv_stake", ratio)
+    elif domain == "shot":
+        return _grid_mask(headall, "shot_line", "shot_stake", ratio)
+    elif domain == "both":
+        m_recv = _grid_mask(headall, "recv_line", "recv_stake", ratio)
+        m_shot = _grid_mask(headall, "shot_line", "shot_stake", ratio)
+        trace_mask = m_recv | m_shot
+        log.info("  union: miss=%.4f (recv alone=%.4f  shot alone=%.4f)",
+                 1.0 - trace_mask.mean(),
+                 1.0 - m_recv.mean(), 1.0 - m_shot.mean())
+        return trace_mask
+    elif domain == "4d":
+        # Sample on unique (shot_line, shot_stake, recv_line, recv_stake) combos
+        keys_4d = np.column_stack([
+            headall["shot_line"], headall["shot_stake"],
+            headall["recv_line"], headall["recv_stake"],
+        ])
+        uniq_keys, inv_idx = np.unique(keys_4d, axis=0, return_inverse=True)
+        mask_4d = np.random.random(len(uniq_keys)) < ratio
+        trace_mask = mask_4d[inv_idx]
+        log.info("  4d grid: %d unique combos, miss=%.4f",
+                 len(uniq_keys), 1.0 - trace_mask.mean())
+        return trace_mask
+    else:
+        raise ValueError(f"Unknown MASK_DOMAIN={domain!r}; choose receiver|shot|both|4d")
 
 
-#Save label data here before generating missing data by xd 2026-05-11
-#modified by xd, 2026-05-11
-#if output_type == 'h5':
-#print(f'Dumping {h5_path}label.h5 now ...')
-print(f'Dumping {h5_path}label.h5 now ...')
-segy2h5(f'{h5_path}new.h5', all_data['data'], group_name='1551', headers_df=pdinfo) #output h5 label data
-#output segy lable with sorted sequence
-#sout = sio.output(segy_path+'new.sgy', ns=sio_tmp.ns, vsi=sio_tmp.vsi, endian=">", format=5, txtenc="ebcdic",thdef=jsons2)
-sout = sio.output(segy_path+'new.sgy', ns=sio_tmp.ns, vsi=sio_tmp.vsi, endian=">", txtenc="ebcdic",thdef=jsons2)
-sout.init()
-nwritten = sout.write_traces(traces=all_data) #use original headers with sorted order, by xd, 2026-05-11
-print(f'Total write mask traces {nwritten}')
-sout.finalize()
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-print(f'Missing traces ratio: {1.0 - np.sum(trace_mask)/ntraces}')
-#save the mask array here, by xd, 2026-05-12
-np.save(segy_path+'bool_mask_arr',trace_mask)
+def main():
+    if not INPUT_SGY:
+        log.error("INPUT_SGY is not set. Usage: INPUT_SGY=/path/to/data.sgy [SEGY_CONFIG=a002] bash run_mk_irr_mask.sh")
+        return
 
-# 3. Apply the mask to the structured array
-dataset_irr = all_data[trace_mask]  #irregular data sampling
+    # ---- Load SEG-Y config preset ----
+    try:
+        segy_config.load_config(PRESET)
+    except ValueError as e:
+        log.error(e)
+        return
+    log.info("Active preset: %s", segy_config.get_active_name())
+    log.info("Config summary: %s", segy_config.get_config_summary())
 
-#data interpolation, keep header, zeroed traces
-all_data['data'][~trace_mask]=0.
-dataset = all_data
+    sort_keys = segy_config.get_sort_keys()
+    log.info("Sort keys: %s", sort_keys)
 
-# Convert to native and then use NumPy's unique on the structured array
-sxy_arr = dataset_irr[['sp_east', 'sp_north']].copy()
-sxy_arr = sxy_arr.astype(np.dtype([('sp_east', np.int32), ('sp_north', np.int32)]))
-sxy = np.unique(sxy_arr)
-sxy = sxy.view(np.int32).reshape(-1, 2)   # convert to 2D array of ints
+    # ---- Build thdef and write temp JSON for seisio ----
+    thdef = _build_thdef()
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(thdef, f, indent=2)
+        tmp_thdef = f.name
+    log.info("Generated temp thdef: %s (%d fields)", tmp_thdef, len(thdef))
 
-gxy_arr = dataset_irr[['gp_east', 'gp_north']].copy()
-gxy_arr = gxy_arr.astype(np.dtype([('gp_east', np.int32), ('gp_north', np.int32)]))
-gxy = np.unique(gxy_arr)
-gxy = gxy.view(np.int32).reshape(-1, 2)   # convert to 2D array of ints
-
-#coordinates QC by xd, 2026-05-11
-np.savetxt(segy_path+'shot_xy_cut.dat', sxy, delimiter='\t', fmt='%d')
-np.savetxt(segy_path+'rcvs_xy_cut.dat', gxy, delimiter='\t', fmt='%d')
-
-#data QC by xd, 2026-05-11
-dataset_irr['data'][:10000].astype('float32').tofile(f'{segy_path}tmp_5dgather_irr_{nsamples}.bin')
-dataset['data'][:10000].astype('float32').tofile(f'{segy_path}tmp_5dgather_mask_{nsamples}.bin')
-
-#if output_type == 'segy':   #czt 0511 merge 'segy' mode and 'h5' mode
-print(f'Dumping {h5_path}irr.h5 now ...')
-mask_new = pdinfo[trace_mask]
-segy2h5(h5_path+f'irr_{1-missing_perc}.h5', dataset_irr['data'], group_name='1551', headers_df=mask_new) #add missing prec in file_path  czt0511
-    
-print(f'Dumping {h5_path}mask.h5 now ...')
-segy2h5(h5_path+f'mask_{1-missing_perc}.h5', dataset['data'], group_name='1551', headers_df=pdinfo)
-
-print(f'Dumping {segy_path}+irr.sgy now ...')
-#save segy file
-#sout = sio.output(segy_path+'irr.sgy', ns=sio_tmp.ns, vsi=sio_tmp.vsi, endian=">", format=5, txtenc="ebcdic",thdef=jsons2)
-sout = sio.output(segy_path+f'irr_{1-missing_perc}.sgy', ns=sio_tmp.ns, vsi=sio_tmp.vsi, endian=">", txtenc="ebcdic",thdef=jsons2)
-sout.init()
-nwritten = sout.write_traces(traces=dataset_irr)
-print(f'Total write irr traces {nwritten}')
-sout.finalize()
-
-#sout = sio.output(segy_path+'mask.sgy', ns=sio_tmp.ns, vsi=sio_tmp.vsi, endian=">", format=5, txtenc="ebcdic",thdef=jsons2)
-sout = sio.output(segy_path+f'mask_{1-missing_perc}.sgy', ns=sio_tmp.ns, vsi=sio_tmp.vsi, endian=">", txtenc="ebcdic",thdef=jsons2)
-sout.init()
-nritten = sout.write_traces(traces=dataset)
-print(f'Total write mask traces {nwritten}')
-sout.finalize()
-#else:
-print("All data dumping out, program completed!")
-
-quit()
-os._exit(os.EX_OK)
+    try:
+        _run(thdef, tmp_thdef, sort_keys)
+    finally:
+        os.unlink(tmp_thdef)
+        log.info("Cleaned up temp thdef: %s", tmp_thdef)
 
 
+def _run(thdef: dict, tmp_thdef: str, sort_keys: list):
+    """Core logic — wrapped in try/finally by main() for temp thdef cleanup."""
+    # ---- Output paths ----
+    stem = os.path.splitext(os.path.basename(INPUT_SGY))[0]
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    h5_dir = os.path.join(OUTPUT_DIR, "h5")
+    os.makedirs(h5_dir, exist_ok=True)
+
+    segy_prefix = os.path.join(OUTPUT_DIR, f"{stem}-")
+    h5_prefix = os.path.join(h5_dir, f"{stem}-")
+    log.info("Output prefix: segy=%s  h5=%s", segy_prefix, h5_prefix)
+
+    # ---- 1. Read SEG-Y & headers ----
+    sio_obj = sio.input(INPUT_SGY, filetype="SGY", thdef=tmp_thdef)
+
+    ntraces = sio_obj.nt
+    nsamples = sio_obj.ns
+    sampling_interval = sio_obj.vsi
+
+    headall = sio_obj.read_all_headers()
+    log.info("Traces=%d  Samples=%d  dt=%s", ntraces, nsamples, sampling_interval)
+
+    # ---- 2. Build header DataFrame (field names = thdef keys) ----
+    df = pd.DataFrame({col: headall[col] for col in thdef})
+    df.index.name = "trace_idx"
+    df = _ensure_native_endian(df)
+
+    # Apply scalar correction to coordinates that need it
+    scalar = df["scalar"].replace(0, 1).abs()
+    for col in COORD_COLS:
+        if col in df.columns:
+            df[col] = df[col].div(scalar, axis=0)
+
+    # ---- 3. Sort into regular 5D grid order ----
+    df.sort_values(by=sort_keys, ascending=[True] * len(sort_keys),
+                   na_position="last", inplace=True)
+    sort_idx = df.index.to_numpy(dtype=np.intp)
+
+    # ---- 4. Create missing trace mask ----
+    trace_mask = _build_trace_mask(headall, MISSING_RATIO, MASK_DOMAIN)
+
+    # ---- 5. Load all trace data in sorted order ----
+    all_data = sio_obj.read_all_traces()[sort_idx]
+
+    # ---- 6. Export label (complete data) ----
+    log.info("Exporting label (full data) …")
+    _write_h5(f"{h5_prefix}new.h5", all_data["data"], df)
+    _write_segy(f"{segy_prefix}new.sgy", all_data, nsamples, sampling_interval, tmp_thdef)
+
+    # ---- 7. Build irregular & mask variants ----
+    irr_data = all_data[trace_mask]
+    mask_data = all_data.copy()
+    mask_data["data"][~trace_mask] = 0.0
+
+    irr_df = df[trace_mask]
+    suffix = f"{1 - MISSING_RATIO}"
+
+    # ---- 8. Export irregular data ----
+    log.info("Exporting irregular …")
+    _write_h5(f"{h5_prefix}irr_{suffix}.h5", irr_data["data"], irr_df)
+    _write_segy(f"{segy_prefix}irr_{suffix}.sgy", irr_data, nsamples, sampling_interval, tmp_thdef)
+
+    # ---- 9. Export mask data (zeroed missing) ----
+    log.info("Exporting mask …")
+    _write_h5(f"{h5_prefix}mask_{suffix}.h5", mask_data["data"], df)
+    _write_segy(f"{segy_prefix}mask_{suffix}.sgy", mask_data, nsamples, sampling_interval, tmp_thdef)
+
+    # ---- 10. Save mask array ----
+    np.save(f"{segy_prefix}bool_mask_arr", trace_mask)
+
+    # ---- 11. Coordinate QC (grid coordinates: shot_x_grid / recv_x_grid) ----
+    if "shot_x_grid" in thdef:
+        sxy = np.unique(irr_data[["shot_x_grid", "shot_y_grid"]].astype(np.int32))
+        sxy = sxy.view(np.int32).reshape(-1, 2)
+        gxy = np.unique(irr_data[["recv_x_grid", "recv_y_grid"]].astype(np.int32))
+        gxy = gxy.view(np.int32).reshape(-1, 2)
+        np.savetxt(f"{segy_prefix}shot_xy_cut.dat", sxy, delimiter="\t", fmt="%d")
+        np.savetxt(f"{segy_prefix}rcvs_xy_cut.dat", gxy, delimiter="\t", fmt="%d")
+    else:
+        log.warning("Skipping coordinate QC: shot_x_grid / recv_x_grid not in preset")
+
+    # ---- 12. Binary QC dump ----
+    irr_data["data"][:10000].astype("float32").tofile(f"{segy_prefix}tmp_5dgather_irr_{nsamples}.bin")
+    mask_data["data"][:10000].astype("float32").tofile(f"{segy_prefix}tmp_5dgather_mask_{nsamples}.bin")
+
+    log.info("All done.")
+
+
+if __name__ == "__main__":
+    main()

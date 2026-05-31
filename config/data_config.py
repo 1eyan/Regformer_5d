@@ -40,7 +40,7 @@ _g.add_argument(
 )
 
 _g = _parser.add_argument_group("Data shape")
-_g.add_argument("--time_ps", type=int, default=1256, help="Number of time samples per trace")
+_g.add_argument("--time_ps", type=int, default=1251, help="Number of time samples per trace")
 _g.add_argument("--trace_ps", type=int, default=128, help="Patch trace count (Q + K)")
 
 _g = _parser.add_argument_group("Training / inference flags")
@@ -98,7 +98,7 @@ _g.add_argument(
 _g.add_argument(
     "--epoch_repeat",
     type=int,
-    default=4,
+    default=6,
     help="Repeat each anchor this many times per epoch (with different random seeds for diversity)",
 )
 _g.add_argument(

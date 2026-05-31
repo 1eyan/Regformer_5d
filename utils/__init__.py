@@ -22,4 +22,5 @@ from .segy_utils import (
     read_segy_headers,
     sort_output_segy,
     write_segy_data,
+    write_segy_data_incremental,
 )

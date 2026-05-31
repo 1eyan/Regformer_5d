@@ -33,6 +33,7 @@ from utils import (
     read_segy_headers,
     sort_output_segy,
     write_segy_data,
+    write_segy_data_incremental,
 )
 
 
@@ -84,7 +85,7 @@ def setup_ddp() -> Tuple[int, int, int]:
 
 
 def load_checkpoint(model: torch.nn.Module, path: str, strict: bool, logger: logging.Logger) -> None:
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt.get("model", ckpt))) if isinstance(ckpt, dict) else ckpt
     if any(k.startswith("module.") for k in state):
         state = OrderedDict((k.replace("module.", "", 1), v) for k, v in state.items())
@@ -142,6 +143,7 @@ def apply_training_config(args: argparse.Namespace, train_cfg: Dict[str, Any]) -
         "use_coord_encoding",
         "use_rope",
         "use_p_scale",
+        "encode_observed_only",
     ]
     for key in int_keys:
         value = _first_of(key, cfg=train_cfg)
@@ -178,6 +180,16 @@ def apply_training_config(args: argparse.Namespace, train_cfg: Dict[str, Any]) -
         args.rope_frequency_config = rope_cfg
         args.rope_omega_bands = rope_cfg.get("omega_bands")
 
+    # Restore trace_sort_keys from training config (critical for patch ordering consistency)
+    trace_sort_keys = _first_of("trace_sort_keys", cfg=train_cfg)
+    if trace_sort_keys is not None:
+        if isinstance(trace_sort_keys, str):
+            args.trace_sort_keys = tuple(k.strip() for k in trace_sort_keys.split(",") if k.strip())
+        elif isinstance(trace_sort_keys, (list, tuple)):
+            args.trace_sort_keys = tuple(str(k).strip() for k in trace_sort_keys if str(k).strip())
+    else:
+        args.trace_sort_keys = None
+
 
 def build_model(args: argparse.Namespace) -> torch.nn.Module:
     return create_gated_model_v9_encdec(
@@ -207,10 +219,18 @@ def build_model(args: argparse.Namespace) -> torch.nn.Module:
 def prepare_rope_frequency(args: argparse.Namespace, dataset, logger: logging.Logger) -> Dict[str, Any]:
     cfg = getattr(args, "rope_frequency_config", None)
     if cfg and cfg.get("omega_bands") is not None:
-        args.rope_freq_mode = cfg.get("rope_freq_mode", args.rope_freq_mode)
-        args.rope_omega_bands = cfg.get("omega_bands")
-        logger.info("using RoPE frequency config restored from checkpoint: mode=%s", args.rope_freq_mode)
-        return cfg
+        omega_bands = cfg["omega_bands"]
+        # Check for string corruption from json.dump(default=str) on numpy arrays
+        if isinstance(omega_bands, str):
+            logger.warning(
+                "omega_bands in checkpoint is a string (corrupted by JSON serialization). "
+                "Recomputing from scratch ..."
+            )
+        else:
+            args.rope_freq_mode = cfg.get("rope_freq_mode", args.rope_freq_mode)
+            args.rope_omega_bands = omega_bands
+            logger.info("using RoPE frequency config restored from checkpoint: mode=%s", args.rope_freq_mode)
+            return cfg
 
     head_dim = int(args.d_model) // int(args.n_heads)
     part_dim = head_dim // int(args.coord_dim)
@@ -343,6 +363,61 @@ def fill_segy(args, headers, missing_global, pred_sum, pred_count, logger, label
     return summary
 
 
+def _make_periodic_fill_callback(
+    output_segy: str,
+    mask_path: str,
+    mask_data: np.ndarray,
+    headers: list,
+    missing_global: np.ndarray,
+    time_ps: int,
+    logger: logging.Logger,
+):
+    """Return a closure that checkpoints current predictions into *output_segy*.
+
+    First invocation copies *mask_path* → *output_segy* (template).
+    Subsequent ones open the existing file in ``r+`` and write only traces
+    that are marked missing and have accumulated predictions.
+
+    Signature ``(pred_sum, pred_count, flush_count)`` matches the
+    ``flush_callback`` expected by ``run_queryctx_inference``.
+    """
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    lookup = build_lookup(headers)
+    out = mask_data.copy()
+    ns = mask_data.shape[1]
+    _initialized = False
+
+    def _callback(pred_sum, pred_count, flush_count):
+        nonlocal _initialized
+
+        if not _initialized:
+            _Path(output_segy).parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copy2(mask_path, output_segy)
+            _initialized = True
+
+        seen: dict = {}
+        for key, total in pred_sum.items():
+            for trace_idx in lookup.get(key, []):
+                if missing_global[trace_idx]:
+                    avg = total / max(pred_count[key], 1)
+                    trace = fit_trace(avg, ns, time_ps=time_ps)
+                    out[trace_idx] = trace
+                    seen[trace_idx] = trace
+
+        if seen:
+            write_segy_data_incremental(
+                output_segy,
+                np.array(list(seen.keys()), dtype=np.intp),
+                np.array(list(seen.values()), dtype=np.float32),
+            )
+        logger.info("periodic fill [flush %d]: wrote %d traces to %s",
+                     flush_count, len(seen), output_segy)
+
+    return _callback
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="E2E V9 queryctx inference and SEGY fill")
     parser.add_argument("--checkpoint", required=True)
@@ -359,7 +434,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_residual_segy", default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch_size", type=int, default=6)
-    parser.add_argument("--time_ps", type=int, default=1256)
+    parser.add_argument("--fill_interval", type=int, default=0,
+                        help="Periodic SEGY checkpoint every N batch flushes "
+                             "(0=disabled). Only rank 0 writes in DDP mode.")
+    parser.add_argument("--pred_clamp", type=optional_float, default=None,
+                        help="Hard clamp model predictions to [-v, v] before inverse "
+                             "amplitude scaling (default: None = no clamp).")
+    parser.add_argument("--time_ps", type=int, default=1251)
     parser.add_argument("--trace_ps", type=int, default=128)
     parser.add_argument("--chunk_length", type=int, default=256)
     parser.add_argument("--overlap_ratio", type=float, default=0.125)
@@ -404,31 +485,30 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _cleanup_stale_rank_results(output_dir: str, logger: logging.Logger, is_main: bool) -> None:
-    stale_dir = Path(output_dir) / ".rank_results"
-    if stale_dir.exists():
+def _cleanup_stale_rank_results(rank_tmp: Path, logger: logging.Logger, is_main: bool) -> None:
+    if rank_tmp.exists():
         import shutil
 
         if is_main:
-            logger.info("cleaning up stale rank results: %s", stale_dir)
-        shutil.rmtree(stale_dir, ignore_errors=True)
+            logger.info("cleaning up stale rank results: %s", rank_tmp)
+        shutil.rmtree(rank_tmp, ignore_errors=True)
 
 
-def _merge_rank_results(args, rank, world_size, is_main, logger, pred_sum, pred_count):
+def _merge_rank_results(rank_tmp: Path, rank, world_size, is_main, logger, pred_sum, pred_count):
     if world_size <= 1:
         return pred_sum, pred_count
 
     import pickle
     import shutil
 
-    rank_base = Path(args.output_dir) / ".rank_results"
+    rank_base = rank_tmp
     rank_dir = rank_base / f"rank_{rank}"
     rank_dir.mkdir(parents=True, exist_ok=True)
 
     rank_keys = list(pred_sum.keys())
     with open(rank_dir / "pred_keys.pkl", "wb") as f:
         pickle.dump(rank_keys, f, protocol=pickle.HIGHEST_PROTOCOL)
-    np.savez_compressed(rank_dir / "pred_sum.npz", **{f"arr_{i}": pred_sum[k] for i, k in enumerate(rank_keys)})
+    np.savez(rank_dir / "pred_sum.npz", **{f"arr_{i}": pred_sum[k] for i, k in enumerate(rank_keys)})
     with open(rank_dir / "pred_count.json", "w", encoding="utf-8") as f:
         json.dump({"__".join(map(str, k)): int(v) for k, v in pred_count.items()}, f)
     (rank_base / f".rank_{rank}_done").touch()
@@ -499,7 +579,15 @@ def main() -> None:
             logger.info("loaded training_config.json from checkpoint directory")
         print_segy_config()
 
-    _cleanup_stale_rank_results(args.output_dir, logger, is_main)
+    # Compute shared temp directory for cross-rank result exchange.
+    # Uses local storage (typically /tmp) rather than output_dir to avoid
+    # NFS I/O pressure from 8 concurrent writers.
+    import hashlib as _hashlib
+    import tempfile as _tempfile
+    _RANK_TMP = Path(_tempfile.gettempdir()) / (
+        "infer_merge_" + _hashlib.md5(args.output_dir.encode()).hexdigest()[:12]
+    )
+    _cleanup_stale_rank_results(_RANK_TMP, logger, is_main)
     total_start = time.perf_counter()
 
     if is_main:
@@ -526,6 +614,7 @@ def main() -> None:
         label_data = None
 
     logger.info("building DatasetH5_all_queryctx inference dataset")
+    trace_sort_keys = getattr(args, "trace_sort_keys", None)
     dataset = DatasetH5_all_queryctx(
         h5File=args.h5_irregular,
         h5File_regular=args.h5_regular,
@@ -536,6 +625,7 @@ def main() -> None:
         time_ps=args.time_ps,
         trace_ps=args.trace_ps,
         target_mode="self",
+        trace_sort_keys=trace_sort_keys,
     )
     logger.info("queryctx dataset ready: samples=%d time_ps=%d", len(dataset), dataset.time_ps)
     rope_cfg = prepare_rope_frequency(args, dataset, logger)
@@ -558,6 +648,19 @@ def main() -> None:
             args.overlap_ratio,
         )
 
+    # ---- Periodic fill callback (optional) ----
+    fill_callback = None
+    if is_main and args.fill_interval > 0:
+        fill_callback = _make_periodic_fill_callback(
+            output_segy=args.output_segy,
+            mask_path=args.mask_path,
+            mask_data=mask_data,
+            headers=headers,
+            missing_global=missing_global,
+            time_ps=args.time_ps,
+            logger=logger,
+        )
+
     pred_sum, pred_count, inference_seconds, infer_stats = run_queryctx_inference(
         dataset=dataset,
         model=model,
@@ -572,10 +675,13 @@ def main() -> None:
         logger=logger,
         rank=rank,
         world_size=world_size,
+        flush_callback=fill_callback,
+        flush_interval=args.fill_interval,
+        pred_clamp=args.pred_clamp,
     )
 
     pred_sum, pred_count = _merge_rank_results(
-        args, rank, world_size, is_main, logger, pred_sum, pred_count
+        _RANK_TMP, rank, world_size, is_main, logger, pred_sum, pred_count
     )
 
     if is_main:
