@@ -63,16 +63,29 @@ def parse_metric_weights(metric_weights: Optional[Sequence[float]]) -> np.ndarra
 def _normalize_minmax_neg1_to_1(coords: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     min_v = np.min(coords, axis=0)
     max_v = np.max(coords, axis=0)
+    coords_norm = _normalize_with_minmax_neg1_to_1(coords, min_v, max_v)
+    stats = _coord_stats(coords)
+    return coords_norm, stats
+
+
+def _normalize_with_minmax_neg1_to_1(
+    coords: np.ndarray,
+    min_v: np.ndarray,
+    max_v: np.ndarray,
+) -> np.ndarray:
     range_v = max_v - min_v
     safe_range = np.where(range_v > 0.0, range_v, 1.0)
     coords_norm = 2.0 * (coords - min_v) / safe_range - 1.0
-    stats = {
-        "min": min_v.astype(np.float32),
-        "max": max_v.astype(np.float32),
+    return coords_norm.astype(np.float32)
+
+
+def _coord_stats(coords: np.ndarray) -> Dict[str, np.ndarray]:
+    return {
+        "min": np.min(coords, axis=0).astype(np.float32),
+        "max": np.max(coords, axis=0).astype(np.float32),
         "mean": np.mean(coords, axis=0).astype(np.float32),
         "std": np.std(coords, axis=0).astype(np.float32),
     }
-    return coords_norm.astype(np.float32), stats
 
 
 def normalize_coords(
@@ -86,20 +99,37 @@ def normalize_coords(
         coord_grid: optional grid coordinates, shape [N_grid, 4]
 
     Returns:
-        If coord_grid is None: ``coord_obs_norm, stats``
-        Else: ``coord_obs_norm, coord_grid_norm, stats``
-        ``stats`` has keys ``obs`` / ``grid`` with min/max/mean/std.
+        If coord_grid is None: ``coord_obs_norm, stats``.
+        Else: ``coord_obs_norm, coord_grid_norm, stats``.
+
+        When both observed and grid coordinates are provided, both are
+        normalized with the *grid* min/max. Query-context patch search compares
+        observed points against regular-grid query points, so both sides must
+        live in one coordinate frame. Normalizing obs and grid separately makes
+        distances invalid when the irregular observations cover only part of
+        the regular survey.
     """
     coord_obs_np = _check_coord_2d(_to_numpy(coord_obs, np.float32), "coord_obs")
-    coord_obs_norm, obs_stats = _normalize_minmax_neg1_to_1(coord_obs_np)
-    stats: Dict[str, Dict[str, np.ndarray]] = {"obs": obs_stats}
 
     if coord_grid is None:
+        coord_obs_norm, obs_stats = _normalize_minmax_neg1_to_1(coord_obs_np)
+        stats: Dict[str, Dict[str, np.ndarray]] = {"obs": obs_stats}
         return coord_obs_norm, stats
 
     coord_grid_np = _check_coord_2d(_to_numpy(coord_grid, np.float32), "coord_grid")
-    coord_grid_norm, grid_stats = _normalize_minmax_neg1_to_1(coord_grid_np)
-    stats["grid"] = grid_stats
+    grid_min = np.min(coord_grid_np, axis=0)
+    grid_max = np.max(coord_grid_np, axis=0)
+    coord_obs_norm = _normalize_with_minmax_neg1_to_1(coord_obs_np, grid_min, grid_max)
+    coord_grid_norm = _normalize_with_minmax_neg1_to_1(coord_grid_np, grid_min, grid_max)
+    stats = {
+        "obs": _coord_stats(coord_obs_np),
+        "grid": _coord_stats(coord_grid_np),
+        "normalization": {
+            "min": grid_min.astype(np.float32),
+            "max": grid_max.astype(np.float32),
+            "source": np.asarray("grid_minmax"),
+        },
+    }
     return coord_obs_norm, coord_grid_norm, stats
 
 

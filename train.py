@@ -82,8 +82,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf_grad_loss_weight", type=float, default=0.2)
     parser.add_argument("--phase_loss_weight", type=float, default=0.0)
     parser.add_argument("--coord_aug_scale", type=float, default=0.0,
-                        help="Coord augmentation strength (>0 = enable rotation+scaling+centering). "
-                             "0=disabled (default). Suggested: 0.01~0.05")
+                        help="Conservative coord augmentation magnitude in normalized [-1,1] coords "
+                             "(bounded shared translation + small jitter). "
+                             "0=disabled (default). Suggested: 0.005~0.03")
 
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_heads", type=int, default=8)

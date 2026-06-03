@@ -539,6 +539,9 @@ def save_norm_stats(path: Path, stats: Dict[str, Dict[str, np.ndarray]]) -> None
         "grid_mean": stats["grid"]["mean"],
         "grid_std": stats["grid"]["std"],
     }
+    if "normalization" in stats:
+        flat["norm_min"] = stats["normalization"]["min"]
+        flat["norm_max"] = stats["normalization"]["max"]
     np.savez(path, **flat)
 
 
@@ -696,10 +699,10 @@ if __name__ == "__main__":
     parser.add_argument("--stride-divisors", type=int, nargs=4, default=(6, 21, 7, 5))
     parser.add_argument("--on-grid-collision", choices=["raise", "last"], default="raise")
     parser.add_argument("--query-mask-mode", choices=["regular_true", "regular_false", "all", "none"],
-                        default="regular_true")
+                        default="regular_false")
     parser.add_argument("--infer-obs-valid-source", choices=["none", "regular_mask"], default="none")
     parser.add_argument("--infer-top-l", type=int, default=None, help="auto as k_patch * 2 if None")
-    parser.add_argument("--max-query-per-patch", type=int, default=128)
+    parser.add_argument("--max-query-per-patch", type=int, default=32)
     parser.add_argument("--gpu-query-chunk-size", type=int, default=128)
     parser.add_argument("--infer-gpu-device", type=str, default="cuda:0")
     parser.add_argument("--infer-use-gpu", action=argparse.BooleanOptionalAction, default=False)
@@ -873,15 +876,12 @@ if __name__ == "__main__":
 
             # ── optional key-mean aggregation ──
             if args.raw_key_aggregate == "mean":
-                trace_obs, coord_obs, obs_keys, key_counts = _aggregate_raw_by_keys_mean(
-                    trace_obs=trace_obs_raw,
-                    coord_obs=coord_obs_raw,
-                    raw_keys=raw_keys,
-                )
-                np.save(os.path.join(patch_dir, "raw_key_counts.npy"), key_counts)
-                print(
-                    "raw key-mean aggregation:",
-                    f"before={trace_obs_raw.shape[0]} after={trace_obs.shape[0]}",
+                raise ValueError(
+                    "--raw_key_aggregate=mean is incompatible with queryctx npz outputs "
+                    "unless you also write and train/infer against an aggregated irregular H5. "
+                    "The saved context indices would otherwise refer to aggregated rows, while "
+                    "DatasetH5_all_queryctx interprets them as original irregular-H5 row indices. "
+                    "Use --raw_key_aggregate none for patch files consumed by the current dataset."
                 )
             else:
                 trace_obs = trace_obs_raw

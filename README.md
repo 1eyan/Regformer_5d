@@ -394,10 +394,10 @@ value-based anchor 参数：
 | `--block-divisors` | `6 21 7 5` | 未提供 `block-size` 时，用 grid 维度除以该值 |
 | `--stride-divisors` | `6 21 7 5` | 未提供 `stride` 时，用 grid 维度除以该值 |
 | `--on-grid-collision` | `raise` | 规则网格 4D cell 冲突处理；可选 `raise`、`last` |
-| `--query-mask-mode` | `regular_true` | 可选 `regular_true`、`regular_false`、`all`、`none` |
+| `--query-mask-mode` | `regular_false` | 可选 `regular_true`、`regular_false`、`all`、`none`；`regular_false` 表示预测 mask 中缺失/零值道 |
 | `--infer-obs-valid-source` | `none` | 推理 context 是否受 regular mask 过滤 |
 | `--infer-top-l` | `None` | 推理 context 候选邻域；空值时为 `k_patch * 2` |
-| `--max-query-per-patch` | `64` | 单个推理 patch 最大 query 数 |
+| `--max-query-per-patch` | `32` | 单个推理 patch 最大 query 数 |
 | `--gpu-query-chunk-size` | `64` | GPU 推理候选搜索的 query 分批数 |
 | `--infer-gpu-device` | `cuda:0` | 推理候选搜索 GPU |
 | `--infer-use-gpu` / `--no-infer-use-gpu` | `False` | 是否用 GPU 做推理 context 搜索 |
@@ -454,9 +454,9 @@ bash tool/reg_tool/run_precompute.sh
 | `NUM_QUERY` | `8` | query 数提示 |
 | `BETA` | `0.3` | 多样性权重 |
 | `BLOCK_DIVISORS` | `6,21,7,5` | 推理 block divisors |
-| `MAX_QUERY_PER_PATCH` | `128` | 推理 patch 最大 query 数 |
+| `MAX_QUERY_PER_PATCH` | `32` | 推理 patch 最大 query 数 |
 
-注意：当前 `run_precompute.sh` 默认参数列表中固定加入了 `--skip-infer`，因此默认只生成训练池，不生成 `infer_query_context.npz`。若需要推理索引，建议直接运行 `precompute_anchor_patch_v2.py` 或使用 `core.py anchor_patch` 且不要传 `--skip-infer`。
+注意：`run_precompute.sh` 默认同时生成训练池和 `infer_query_context.npz`。若只需要训练池，设置 `SKIP_INFER=true`；若只需要推理索引，设置 `SKIP_TRAIN=true`。
 
 ### 6.4 通用入口: `tool/reg_tool/core.py`
 
@@ -489,7 +489,7 @@ python tool/reg_tool/core.py anchor_patch \
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--raw_key_aggregate` | `mean` | `anchor_patch` 模式下是否按复合 key 对 raw 观测道求均值聚合；可选 `none`、`mean` |
+| `--raw_key_aggregate` | `none` | 当前 queryctx 数据集要求 npz 下标对齐原始 irregular H5 行号；`mean` 会生成聚合数组下标，不能直接用于当前训练/推理 |
 | `--enable-auto-params` | 关闭 | 根据观测系统自动覆盖 `num_anchors`、`k_patch`、`top_l`、`num_query`、block divisors 等 |
 | `--auto-params-anchor-stride` | `128` | 自动估计锚点数量时的步长 |
 | `--trusted_mask_key` | `None` | raw H5 中用于筛选可信观测的 mask 字段 |
@@ -946,6 +946,7 @@ loss = MSE(model(x_t, t, cond), u_t)
 | 数据路径模板 | 当前 shell 脚本内默认路径均指向本机或服务器示例路径，建议项目交付时补充一份实际数据目录规范 |
 | `accelerate_config.yaml` | 如需多 GPU 训练，建议将可复用配置纳入仓库或文档 |
 | mask 语义 | 建议在数据交付说明中明确 `mask=True/1` 表示已有道还是待预测道；当前预计算脚本的 `query-mask-mode` 可以切换 `regular_true` 和 `regular_false` |
+| patch 坐标归一化 | query 和 context 搜索必须使用同一套 regular-grid 坐标归一化；不要让 obs/grid 各自独立归一化后再计算距离 |
 | SEG-Y key 唯一性 | 建议在验收前统计 regular H5 复合 key 是否唯一，避免回填时一键多道或未匹配 |
 
 ## 十二、端到端命令模板

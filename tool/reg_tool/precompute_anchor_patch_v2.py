@@ -195,8 +195,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--query-mask-mode",
         choices=["regular_true", "regular_false", "all", "none"],
-        default="regular_true",
-        help="Notebook default is regular_true because it passes regular mask.astype(bool).",
+        default="regular_false",
+        help="Use regular_false for interpolation: regular mask True means observed/trusted, so False means missing query targets.",
     )
     parser.add_argument(
         "--infer-obs-valid-source",
@@ -205,7 +205,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Notebook default is none.",
     )
     parser.add_argument("--infer-top-l", type=int, default=None)
-    parser.add_argument("--max-query-per-patch", type=int, default=64)
+    parser.add_argument("--max-query-per-patch", type=int, default=32)
     parser.add_argument("--gpu-query-chunk-size", type=int, default=64)
     parser.add_argument("--infer-gpu-device", type=str, default="cuda:0")
     parser.add_argument("--infer-use-gpu", action=argparse.BooleanOptionalAction, default=False)

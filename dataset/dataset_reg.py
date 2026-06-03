@@ -315,61 +315,51 @@ class DatasetH5_all_queryctx:
     # Coordinate augmentation (for self-supervised generalization)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _bounded_shift(values: np.ndarray, max_abs_shift: float, rng: np.random.Generator) -> float:
+        """Sample a shared shift that keeps all coordinates inside [-1, 1]."""
+        lo = max(-float(max_abs_shift), -1.0 - float(np.min(values)))
+        hi = min(float(max_abs_shift), 1.0 - float(np.max(values)))
+        if hi <= lo:
+            return 0.0
+        return float(rng.uniform(lo, hi))
+
     def _augment_coords(self, coords_patch: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-        """Apply coordinate augmentation to improve generalization to unseen positions.
+        """Apply conservative coordinate augmentation in normalized [-1, 1] space.
 
-        Augmentations (applied sequentially) — all coordinates [sx, sy, rx, ry]:
-        1. Random 2D rotation in (x, y) plane
-        2. Random isotropic scaling [0.8, 1.2]
-        3. With 50% prob: center source or receiver coordinates (remove absolute position)
+        ``coord_aug_scale`` is the actual maximum perturbation magnitude. The
+        augmentation avoids rotations and coordinate scaling because those change
+        the physical acquisition geometry without changing the seismic labels.
 
-        Only active when self.train == True and self.coord_aug_scale > 0.
+        Applied steps:
+        1. A bounded shared x/y translation for source and receiver coordinates,
+           preserving source-receiver offsets and local patch geometry.
+        2. Very small per-coordinate jitter to improve robustness to coordinate
+           quantization / header noise.
 
-        Args:
-            coords_patch: (N, 4) array [sx, sy, rx, ry] in normalized [-1, 1]
-            rng: numpy random generator for reproducibility
-        Returns:
-            Augmented coords_patch, same shape and dtype.
+        The returned coordinates are kept inside [-1, 1], so the later [0, 1]
+        conversion does not collapse out-of-range values onto the boundary.
         """
         if not self.train or self.coord_aug_scale <= 0:
             return coords_patch
 
+        max_shift = min(float(self.coord_aug_scale), 0.25)
+        jitter_std = 0.25 * max_shift
         aug = coords_patch.copy().astype(np.float32)
-        sx, sy, rx, ry = aug[:, 0], aug[:, 1], aug[:, 2], aug[:, 3]
 
-        # 1. Random 2D rotation
-        theta = rng.random() * 2 * np.pi
-        cos_t, sin_t = np.cos(theta), np.sin(theta)
-        rx_new = rx * cos_t - ry * sin_t
-        ry_new = rx * sin_t + ry * cos_t
-        sx_new = sx * cos_t - sy * sin_t
-        sy_new = sx * sin_t + sy * cos_t
-        rx, ry, sx, sy = rx_new, ry_new, sx_new, sy_new
+        dx = self._bounded_shift(aug[:, [0, 2]], max_shift, rng)
+        dy = self._bounded_shift(aug[:, [1, 3]], max_shift, rng)
+        aug[:, 0] += dx
+        aug[:, 2] += dx
+        aug[:, 1] += dy
+        aug[:, 3] += dy
 
-        # 2. Random isotropic scaling
-        scale = rng.uniform(0.8, 1.2)
-        rx *= scale
-        ry *= scale
-        sx *= scale
-        sy *= scale
+        if jitter_std > 0:
+            jitter = rng.normal(0.0, jitter_std, size=aug.shape).astype(np.float32)
+            jitter = np.clip(jitter, -max_shift, max_shift)
+            jitter = np.minimum(np.maximum(jitter, -1.0 - aug), 1.0 - aug)
+            aug += jitter
 
-        # 3. Random centering (50% prob) — remove absolute position
-        if rng.random() > 0.5:
-            if rng.random() > 0.5:
-                dx = rng.choice(rx)
-                dy = rng.choice(ry)
-            else:
-                dx = rng.choice(sx)
-                dy = rng.choice(sy)
-            rx -= dx
-            ry -= dy
-            sx -= dx
-            sy -= dy
-
-        aug[:, 0] = sx
-        aug[:, 1] = sy
-        aug[:, 2] = rx
-        aug[:, 3] = ry
         return aug
 
     # ------------------------------------------------------------------

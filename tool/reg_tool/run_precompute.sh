@@ -42,6 +42,8 @@ QUERY_MASK_MODE="${QUERY_MASK_MODE:-regular_false}"
 MAX_QUERY_PER_PATCH="${MAX_QUERY_PER_PATCH:-32}"
 INFER_GPU_DEVICE="${INFER_GPU_DEVICE:-cuda:5}"
 GPU_QUERY_CHUNK_SIZE="${GPU_QUERY_CHUNK_SIZE:-128}"
+SKIP_TRAIN="${SKIP_TRAIN:-false}"
+SKIP_INFER="${SKIP_INFER:-false}"
 
 # ── 拆分逗号分隔的多值参数 ────────────────────────────────────
 IFS=',' read -ra _block_divs  <<< "${BLOCK_DIVISORS}"
@@ -72,11 +74,12 @@ ARGS=(
     --gpu-query-chunk-size  "${GPU_QUERY_CHUNK_SIZE}"
     --infer-gpu-device      "${INFER_GPU_DEVICE}"
     --no-infer-use-gpu
-    --skip-infer
 )
 
 [[ -n "${NUM_ANCHORS}" ]] && ARGS+=(--num-anchors "${NUM_ANCHORS}")
 [[ -n "${TOP_L}" ]]       && ARGS+=(--top-l "${TOP_L}")
+[[ "${SKIP_TRAIN}" == "true" ]] && ARGS+=(--skip-train)
+[[ "${SKIP_INFER}" == "true" ]] && ARGS+=(--skip-infer)
 
 # 透传用户额外参数
 ARGS+=("$@")
