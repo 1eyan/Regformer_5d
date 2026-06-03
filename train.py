@@ -81,6 +81,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy_loss_weight", type=float, default=2.0)
     parser.add_argument("--hf_grad_loss_weight", type=float, default=0.2)
     parser.add_argument("--phase_loss_weight", type=float, default=0.0)
+    parser.add_argument("--coord_aug_scale", type=float, default=0.0,
+                        help="Coord augmentation strength (>0 = enable rotation+scaling+centering). "
+                             "0=disabled (default). Suggested: 0.01~0.05")
 
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_heads", type=int, default=8)
@@ -888,7 +891,22 @@ def main() -> None:
             trace_ps=args.trace_ps,
             epoch_repeat=args.epoch_repeat,
             target_mode=args.target_mode,
+            coord_aug_scale=args.coord_aug_scale,
         )
+        val_dataset = None
+        if args.dataset_neighbors_test is not None:
+            val_dataset = DatasetH5_all_queryctx(
+                h5File=args.h5File,
+                h5File_regular=args.h5File_regular,
+                h5File_tgt=args.h5File_tgt,
+                dataset_neighbors=args.dataset_neighbors_test,
+                train=False,
+                trace_sort_keys=trace_sort_keys,
+                use_p_scale=args.use_p_scale,
+                time_ps=args.time_ps,
+                trace_ps=args.trace_ps,
+                target_mode="self",
+            )
     finally:
         if rank != 0:
             sys.stdout.close()
@@ -913,7 +931,8 @@ def main() -> None:
             print(f"[e2e_v9][rope] {warning}")
 
     train_sampler = DistributedSampler(dataset) if world_size > 1 else None
-    val_sampler = DistributedSampler(dataset, shuffle=False) if world_size > 1 else None
+    val_ds = val_dataset if val_dataset is not None else dataset
+    val_sampler = DistributedSampler(val_ds, shuffle=False) if world_size > 1 else None
     dl = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -924,7 +943,7 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
     val_dl = DataLoader(
-        dataset,
+        val_ds,
         batch_size=1,
         shuffle=False,
         num_workers=max(0, min(args.num_workers, 2)),

@@ -32,8 +32,11 @@ def load_runtime_dependencies() -> None:
     global generate_binning_keys
     global raw_obs_valid_mask_from_regular_trusted_mask
     global read_coord4, read_trace_data, read_regular_mask
+    global _make_context_selector
+    global _stable_unique_index_list
     global resolve_block_tuple
     global build_grid_index_map_4d_from_coord_grid
+    global make_grid_blocks_from_index_map_4d
     global make_query_mask
     global save_norm_stats
     global object_array, summarize_query_context
@@ -64,6 +67,9 @@ def load_runtime_dependencies() -> None:
             validate_outputs as _validate_outputs,
         )
         from .patch_sampler import (
+            _make_context_selector as _make_context_selector,
+            _stable_unique_index_list as _stable_unique_index_list,
+            make_grid_blocks_from_index_map_4d as _make_grid_blocks_from_index_map_4d,
             normalize_coords as _normalize_coords,
             precompute_infer_patches_4d as _precompute_infer_patches_4d,
             precompute_train_patches_2d as _precompute_train_patches_2d,
@@ -84,6 +90,9 @@ def load_runtime_dependencies() -> None:
             validate_outputs as _validate_outputs,
         )
         from patch_sampler import (
+            _make_context_selector as _make_context_selector,
+            _stable_unique_index_list as _stable_unique_index_list,
+            make_grid_blocks_from_index_map_4d as _make_grid_blocks_from_index_map_4d,
             normalize_coords as _normalize_coords,
             precompute_infer_patches_4d as _precompute_infer_patches_4d,
             precompute_train_patches_2d as _precompute_train_patches_2d,
@@ -96,8 +105,11 @@ def load_runtime_dependencies() -> None:
     read_coord4 = _read_coord4
     read_trace_data = _read_trace_data
     read_regular_mask = _read_regular_mask
+    _make_context_selector = _make_context_selector
+    _stable_unique_index_list = _stable_unique_index_list
     resolve_block_tuple = _resolve_block_tuple
     build_grid_index_map_4d_from_coord_grid = _build_grid_index_map_4d
+    make_grid_blocks_from_index_map_4d = _make_grid_blocks_from_index_map_4d
     make_query_mask = _make_query_mask
     save_norm_stats = _save_norm_stats
     object_array = _object_array
@@ -205,6 +217,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-legacy-anchor-files", action="store_true")
     parser.add_argument("--save-grid-index-map", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--summary-json", type=str, default=None)
+    parser.add_argument(
+        "--train-mode",
+        choices=["anchor", "block"],
+        default="anchor",
+        help="anchor: legacy anchor-based pool; block: 4D block aligned with inference",
+    )
+    parser.add_argument(
+        "--min-obs-per-block",
+        type=int,
+        default=4,
+        help="Minimum raw observations per block to keep as training pool (block mode only)",
+    )
+    parser.add_argument(
+        "--block-pool-margin",
+        type=int,
+        default=1,
+        help="Expand block boundary by this many logical-grid cells when building training pool (block mode only). "
+             "Use 1+ when stride==block_size (no overlap) to cover edge queries whose nearest context may fall in adjacent blocks.",
+    )
     return parser
 
 
@@ -324,52 +355,180 @@ def main() -> None:
     }
 
     if not args.skip_train:
-        if args.train_trusted_source == "all":
-            trusted_idx = np.arange(coord_obs.shape[0], dtype=np.int64)
-        else:
-            trusted_idx = trusted_from_mask
-        if trusted_idx.size == 0:
-            raise ValueError("no trusted training observations are available")
+        if args.train_mode == "block":
+            # ---- Block-based training pools (aligned with inference) ----
+            # Core idea: use the SAME context selection logic as inference.
+            # For each block, we compute the geometric center of raw obs inside it,
+            # then call _make_context_selector (identical to inference) to pick
+            # context from the global obs pool. The training pool is the union of:
+            #   (a) raw obs physically inside the block (query candidates)
+            #   (b) context selected by the inference-style selector (context candidates)
+            block_size = resolve_block_tuple(args.block_size, args.block_divisors, dims_4d, "block_size")
+            stride = resolve_block_tuple(args.stride, args.stride_divisors, dims_4d, "stride")
 
-        print("building train patches")
-        print("train trusted source:", args.train_trusted_source, "count:", trusted_idx.size)
-        train_pack = precompute_train_patches_2d(
-            coord_obs_norm=coord_obs_norm,
-            trace_obs=trace_obs,
-            trusted_idx=trusted_idx,
-            num_anchors=num_anchors,
-            k_patch=k_patch,
-            top_l=top_l,
-            metric_weights=metric_weights,
-            beta=args.beta,
-            anchor_selector=args.train_anchor_selector,
-            facility_nearest_l=top_l,
-            value_local_top_l=value_local_top_l,
-            value_suppression=args.value_suppression,
-            value_suppression_lambda=args.value_suppression_lambda,
-            value_score_tol=args.value_score_tol,
-            value_knn_use_gpu=args.train_knn_use_gpu,
-            value_knn_gpu_batch_rows=args.value_knn_gpu_batch_rows,
-            value_knn_gpu_device=args.value_knn_gpu_device,
-            value_knn_full_matrix_max_n=args.value_knn_full_matrix_max_n,
-            value_suppression_use_gpu=args.train_suppression_use_gpu,
-            num_query=args.num_query,
-            seed=args.seed,
-            pool_size=args.pool_size,
-        )
-        np.savez(
-            patch_dir / "train_pool_idx_2d.npz",
-            pool_idx_2d=train_pack["patch_idx_2d"],
-            anchor_idx=train_pack["anchor_idx"],
-        )
-        if args.save_legacy_anchor_files:
-            np.savez(patch_dir / "anchor_train_patch_idx_2d.npz", **{"0": train_pack["patch_idx_2d"]})
-            np.savez(patch_dir / "anchor_train_context_idx_2d.npz", **{"0": train_pack["context_idx_2d"]})
-            np.savez(patch_dir / "anchor_train_query_idx_2d.npz", **{"0": train_pack["query_idx_2d"]})
-            np.save(patch_dir / "anchor_train_anchor_idx.npy", train_pack["anchor_idx"])
-            np.save(patch_dir / "anchor_train_anchor_coord.npy", train_pack["anchor_coord"])
-        print("train_pool_idx_2d:", train_pack["patch_idx_2d"].shape)
-        summary["train_pool_shape"] = [int(x) for x in train_pack["patch_idx_2d"].shape]
+            # Map raw obs coordinates to 4D logical grid indices
+            sx_levels = grid_info["sx_levels"]
+            sy_levels = grid_info["sy_levels"]
+            rx_levels = grid_info["rx_levels"]
+            ry_levels = grid_info["ry_levels"]
+            isx_obs = np.clip(np.searchsorted(sx_levels, coord_obs_norm[:, 0]), 0, len(sx_levels) - 1)
+            isy_obs = np.clip(np.searchsorted(sy_levels, coord_obs_norm[:, 1]), 0, len(sy_levels) - 1)
+            irx_obs = np.clip(np.searchsorted(rx_levels, coord_obs_norm[:, 2]), 0, len(rx_levels) - 1)
+            iry_obs = np.clip(np.searchsorted(ry_levels, coord_obs_norm[:, 3]), 0, len(ry_levels) - 1)
+
+            # Reuse the exact same block generation as inference
+            blocks = make_grid_blocks_from_index_map_4d(
+                grid_index_map_4d, block_size=block_size, stride=stride
+            )
+
+            # Build context selector using EXACT SAME logic as inference
+            select_contexts = _make_context_selector(
+                obs_coords=coord_obs_norm,
+                k_patch=k_patch,
+                top_l=top_l,
+                metric_weights=metric_weights,
+                beta=args.beta,
+                obs_valid_mask=None,
+                use_gpu=False,
+            )
+
+            pool_rows = []
+            anchor_indices = []
+            block_ids = []
+            for block in blocks:
+                point_idx = block["grid_point_indices"]
+                if point_idx.size == 0:
+                    continue
+
+                # Map grid point coords back to logical indices via searchsorted
+                block_grid_coords = coord_grid_norm[point_idx]
+                isx = np.clip(np.searchsorted(sx_levels, block_grid_coords[:, 0]), 0, len(sx_levels) - 1)
+                isy = np.clip(np.searchsorted(sy_levels, block_grid_coords[:, 1]), 0, len(sy_levels) - 1)
+                irx = np.clip(np.searchsorted(rx_levels, block_grid_coords[:, 2]), 0, len(rx_levels) - 1)
+                iry = np.clip(np.searchsorted(ry_levels, block_grid_coords[:, 3]), 0, len(ry_levels) - 1)
+
+                margin = int(args.block_pool_margin)
+                isx_min = max(0, int(isx.min()) - margin)
+                isx_max = min(len(sx_levels), int(isx.max()) + 1 + margin)
+                isy_min = max(0, int(isy.min()) - margin)
+                isy_max = min(len(sy_levels), int(isy.max()) + 1 + margin)
+                irx_min = max(0, int(irx.min()) - margin)
+                irx_max = min(len(rx_levels), int(irx.max()) + 1 + margin)
+                iry_min = max(0, int(iry.min()) - margin)
+                iry_max = min(len(ry_levels), int(iry.max()) + 1 + margin)
+
+                mask_in_block = (
+                    (isx_obs >= isx_min) & (isx_obs < isx_max) &
+                    (isy_obs >= isy_min) & (isy_obs < isy_max) &
+                    (irx_obs >= irx_min) & (irx_obs < irx_max) &
+                    (iry_obs >= iry_min) & (iry_obs < iry_max)
+                )
+                obs_in_block = np.flatnonzero(mask_in_block).astype(np.int64)
+
+                if obs_in_block.size < args.min_obs_per_block:
+                    continue
+
+                # Chunk obs_in_block into sub-groups to get region-specific anchors.
+                # This mirrors inference: different query chunks → different anchors → different contexts.
+                # Small blocks: single pool. Large blocks: multiple pools with diverse anchors.
+                chunk_size = max(args.min_obs_per_block, 32)
+                n_chunks = max(1, (obs_in_block.size + chunk_size - 1) // chunk_size)
+                n_chunks = min(n_chunks, 5)  # cap to avoid pool explosion
+                actual_chunk_size = (obs_in_block.size + n_chunks - 1) // n_chunks
+
+                rng = np.random.default_rng(args.seed + int(block["block_id"]))
+                perm = rng.permutation(obs_in_block.size)
+                shuffled_obs = obs_in_block[perm]
+
+                for ci in range(n_chunks):
+                    start = ci * actual_chunk_size
+                    end = min(start + actual_chunk_size, obs_in_block.size)
+                    chunk_obs = shuffled_obs[start:end]
+
+                    # Anchor = mean of this chunk's obs coords
+                    # (mirrors inference: anchor_coord = mean(query_coords))
+                    anchor_coord = np.mean(coord_obs_norm[chunk_obs], axis=0).astype(np.float32)
+
+                    # Select context using SAME method as inference
+                    context_batch = select_contexts(anchor_coord[None, :])
+                    if len(context_batch) != 1:
+                        raise RuntimeError(
+                            "context selector returned inconsistent batch size in block training mode"
+                        )
+                    context_idx = np.asarray(context_batch[0], dtype=np.int64).reshape(-1)
+
+                    # Pool = chunk obs ∪ context selected by inference logic
+                    pool_idx = _stable_unique_index_list([chunk_obs, context_idx])
+
+                    if pool_idx.size >= args.min_obs_per_block:
+                        pool_rows.append(pool_idx)
+                        anchor_indices.append(int(block["block_center_grid_index"].item()))
+                        block_ids.append(int(block["block_id"]))
+
+            if not pool_rows:
+                raise ValueError("No valid block pools generated (all blocks have too few observations)")
+
+            max_len = max(len(r) for r in pool_rows)
+            pool_idx_2d = np.full((len(pool_rows), max_len), -1, dtype=np.int64)
+            for i, row in enumerate(pool_rows):
+                pool_idx_2d[i, :len(row)] = row
+
+            np.savez(
+                patch_dir / "train_pool_idx_2d_block.npz",
+                pool_idx_2d=pool_idx_2d,
+                anchor_idx=np.asarray(anchor_indices, dtype=np.int64),
+                block_id=np.asarray(block_ids, dtype=np.int64),
+            )
+            print("train_pool_idx_2d_block:", pool_idx_2d.shape)
+            summary["train_pool_block_shape"] = [int(x) for x in pool_idx_2d.shape]
+        else:
+            # ---- Legacy anchor-based training pools ----
+            if args.train_trusted_source == "all":
+                trusted_idx = np.arange(coord_obs.shape[0], dtype=np.int64)
+            else:
+                trusted_idx = trusted_from_mask
+            if trusted_idx.size == 0:
+                raise ValueError("no trusted training observations are available")
+
+            print("building train patches")
+            print("train trusted source:", args.train_trusted_source, "count:", trusted_idx.size)
+            train_pack = precompute_train_patches_2d(
+                coord_obs_norm=coord_obs_norm,
+                trace_obs=trace_obs,
+                trusted_idx=trusted_idx,
+                num_anchors=num_anchors,
+                k_patch=k_patch,
+                top_l=top_l,
+                metric_weights=metric_weights,
+                beta=args.beta,
+                anchor_selector=args.train_anchor_selector,
+                facility_nearest_l=top_l,
+                value_local_top_l=value_local_top_l,
+                value_suppression=args.value_suppression,
+                value_suppression_lambda=args.value_suppression_lambda,
+                value_score_tol=args.value_score_tol,
+                value_knn_use_gpu=args.train_knn_use_gpu,
+                value_knn_gpu_batch_rows=args.value_knn_gpu_batch_rows,
+                value_knn_gpu_device=args.value_knn_gpu_device,
+                value_knn_full_matrix_max_n=args.value_knn_full_matrix_max_n,
+                value_suppression_use_gpu=args.train_suppression_use_gpu,
+                num_query=args.num_query,
+                seed=args.seed,
+                pool_size=args.pool_size,
+            )
+            np.savez(
+                patch_dir / "train_pool_idx_2d.npz",
+                pool_idx_2d=train_pack["patch_idx_2d"],
+                anchor_idx=train_pack["anchor_idx"],
+            )
+            if args.save_legacy_anchor_files:
+                np.savez(patch_dir / "anchor_train_patch_idx_2d.npz", **{"0": train_pack["patch_idx_2d"]})
+                np.savez(patch_dir / "anchor_train_context_idx_2d.npz", **{"0": train_pack["context_idx_2d"]})
+                np.savez(patch_dir / "anchor_train_query_idx_2d.npz", **{"0": train_pack["query_idx_2d"]})
+                np.save(patch_dir / "anchor_train_anchor_idx.npy", train_pack["anchor_idx"])
+                np.save(patch_dir / "anchor_train_anchor_coord.npy", train_pack["anchor_coord"])
+            print("train_pool_idx_2d:", train_pack["patch_idx_2d"].shape)
+            summary["train_pool_shape"] = [int(x) for x in train_pack["patch_idx_2d"].shape]
 
     if not args.skip_infer:
         block_size = resolve_block_tuple(args.block_size, args.block_divisors, dims_4d, "block_size")
@@ -451,7 +610,7 @@ def main() -> None:
         patch_dir=patch_dir,
         n_obs=coord_obs.shape[0],
         n_grid=coord_grid.shape[0],
-        check_train=not args.skip_train,
+        check_train=not args.skip_train and args.train_mode != "block",
         check_infer=not args.skip_infer,
     )
     summary["validation"] = validation

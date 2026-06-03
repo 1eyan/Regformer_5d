@@ -80,6 +80,7 @@ class DatasetH5_all_queryctx:
         trace_ps: int = 128,
         epoch_repeat: int = 1,
         target_mode: str = "self",
+        coord_aug_scale: float = 0.0,
         dt_ms: int = 4,
         t0_ms: int = 0,
     ):
@@ -94,6 +95,7 @@ class DatasetH5_all_queryctx:
         self._rng = np.random.default_rng(123)
         self.std_val = None
         self.train_num_query = int(max(1, train_num_query))
+        self.coord_aug_scale = float(coord_aug_scale)
         self.train_context_size = (
             None if train_context_size is None else int(max(1, train_context_size))
         )
@@ -310,6 +312,67 @@ class DatasetH5_all_queryctx:
         return data_patch[order], is_query[order], coords_patch[order], order
 
     # ------------------------------------------------------------------
+    # Coordinate augmentation (for self-supervised generalization)
+    # ------------------------------------------------------------------
+
+    def _augment_coords(self, coords_patch: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        """Apply coordinate augmentation to improve generalization to unseen positions.
+
+        Augmentations (applied sequentially) — all coordinates [sx, sy, rx, ry]:
+        1. Random 2D rotation in (x, y) plane
+        2. Random isotropic scaling [0.8, 1.2]
+        3. With 50% prob: center source or receiver coordinates (remove absolute position)
+
+        Only active when self.train == True and self.coord_aug_scale > 0.
+
+        Args:
+            coords_patch: (N, 4) array [sx, sy, rx, ry] in normalized [-1, 1]
+            rng: numpy random generator for reproducibility
+        Returns:
+            Augmented coords_patch, same shape and dtype.
+        """
+        if not self.train or self.coord_aug_scale <= 0:
+            return coords_patch
+
+        aug = coords_patch.copy().astype(np.float32)
+        sx, sy, rx, ry = aug[:, 0], aug[:, 1], aug[:, 2], aug[:, 3]
+
+        # 1. Random 2D rotation
+        theta = rng.random() * 2 * np.pi
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        rx_new = rx * cos_t - ry * sin_t
+        ry_new = rx * sin_t + ry * cos_t
+        sx_new = sx * cos_t - sy * sin_t
+        sy_new = sx * sin_t + sy * cos_t
+        rx, ry, sx, sy = rx_new, ry_new, sx_new, sy_new
+
+        # 2. Random isotropic scaling
+        scale = rng.uniform(0.8, 1.2)
+        rx *= scale
+        ry *= scale
+        sx *= scale
+        sy *= scale
+
+        # 3. Random centering (50% prob) — remove absolute position
+        if rng.random() > 0.5:
+            if rng.random() > 0.5:
+                dx = rng.choice(rx)
+                dy = rng.choice(ry)
+            else:
+                dx = rng.choice(sx)
+                dy = rng.choice(sy)
+            rx -= dx
+            ry -= dy
+            sx -= dx
+            sy -= dy
+
+        aug[:, 0] = sx
+        aug[:, 1] = sy
+        aug[:, 2] = rx
+        aug[:, 3] = ry
+        return aug
+
+    # ------------------------------------------------------------------
     # Coordinate normalization
     # ------------------------------------------------------------------
 
@@ -467,6 +530,10 @@ class DatasetH5_all_queryctx:
         data_patch, is_query, coords_patch, _ = self._sort_traces(
             data_patch, is_query_orig, coords_patch
         )
+
+        # Coordinate augmentation (rotation + scaling + centering)
+        if self.coord_aug_scale > 0:
+            coords_patch = self._augment_coords(coords_patch, rng)
 
         masked_patch = data_patch.copy()
         masked_patch[is_query] = 0.0
@@ -769,6 +836,10 @@ class DatasetH5CSGCRG(DatasetH5_all_queryctx):
         data_patch, is_query, coords_patch, _ = self._sort_traces(
             data_patch, is_query_orig, coords_patch
         )
+
+        # Coordinate augmentation (rotation + scaling + centering)
+        if self.coord_aug_scale > 0:
+            coords_patch = self._augment_coords(coords_patch, rng)
 
         masked_patch = data_patch.copy()
         masked_patch[is_query] = 0.0

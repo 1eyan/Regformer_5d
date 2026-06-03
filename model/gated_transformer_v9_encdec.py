@@ -270,6 +270,10 @@ class GatedSeismicInterpolationTransformerV9EncDec(nn.Module):
             get_norm_layer(norm_type, output_dim, eps=rms_norm_eps),
         )
 
+        # Learnable mask token for missing query positions (zero-init to avoid
+        # systematic DC offset in silent zones before first arrival).
+        self.mask_token = nn.Parameter(torch.zeros(input_dim))
+
         self.dropout = nn.Dropout(dropout)
         self.initialize_weights()
 
@@ -382,6 +386,13 @@ class GatedSeismicInterpolationTransformerV9EncDec(nn.Module):
 
         time_norm = time_bounds.float().clamp(0.0, 1.0)
 
+        # Replace missing query positions with learnable mask token
+        # (before projection so the token lives in raw input space)
+        if mask is not None:
+            observed_mask_pre = self._normalize_observed_mask(mask, input_x).bool()
+            mask_token_expanded = self.mask_token.view(1, 1, -1).expand(batch_size, seq_len, -1)
+            x = torch.where(observed_mask_pre.unsqueeze(-1), x, mask_token_expanded)
+
         # Step 1: Input projection + coordinate encoding
         x = self.input_norm(self.input_proj(x))
         coords_6d = None
@@ -416,11 +427,20 @@ class GatedSeismicInterpolationTransformerV9EncDec(nn.Module):
         )
 
         # Step 4: Cross-attention decoder
+        # Build decoder self-attention block mask:
+        # - All positions can only attend to valid (non-padding) tokens
+        # - Query positions (observed_mask=0) cannot attend to other query positions
+        valid_2d = valid_mask.bool().unsqueeze(1).expand(batch_size, seq_len, seq_len)
+        is_query_i = (~observed_mask).unsqueeze(-1)  # (B, L, 1)
+        is_query_j = (~observed_mask).unsqueeze(1)   # (B, 1, L)
+        decoder_self_mask = valid_2d & ~(is_query_i & is_query_j)
+        decoder_self_mask = decoder_self_mask.to(x.dtype)
+
         decoded = self.decoder(
             x,
             memory,
             skip_initial_proj=True,
-            self_mask=valid_mask,
+            self_mask=decoder_self_mask,
             memory_mask=memory_mask,
             position_ids=position_ids,
             memory_position_ids=memory_pos,
@@ -428,6 +448,16 @@ class GatedSeismicInterpolationTransformerV9EncDec(nn.Module):
 
         # Step 5: Output projection
         output = self.output_proj(decoded)
+
+        # During inference (eval mode), hard-replace observed positions
+        # with the original input values. Training remains untouched.
+        if not self.training and mask is not None:
+            output = torch.where(
+                observed_mask.unsqueeze(-1),
+                input_x,
+                output,
+            )
+
         return output
 
 

@@ -161,7 +161,11 @@ def trace_time_chunk(
 
 def trace_time_unchunk(x_chunked, chunk_info, overlap_ratio=0.0):
     """
-    将切块后的输出重建回原始形状，重叠区域做平均。
+    将切块后的输出重建回原始形状，重叠区域做加权平均（Hann窗）。
+
+    当相邻 chunk 存在时间重叠时，使用 Hann 窗对每段边缘进行平滑衰减，
+    中心区域权重接近 1，边缘逐渐过渡到 0，从而消除 chunk 边界因预测
+    差异导致的拼接痕迹和能量凹陷。
 
     Args:
         x_chunked: (batch_size, num_traces * num_chunks, chunk_length)
@@ -177,22 +181,30 @@ def trace_time_unchunk(x_chunked, chunk_info, overlap_ratio=0.0):
     T_time = chunk_info["time_length"]
 
     out = torch.zeros(B, n_traces, T_time, dtype=x_chunked.dtype, device=x_chunked.device)
-    count = torch.zeros(B, n_traces, T_time, dtype=torch.float32, device=x_chunked.device)
+    weight_sum = torch.zeros(B, n_traces, T_time, dtype=torch.float32, device=x_chunked.device)
+
+    # 预计算 Hann 窗: w[n] = 0.5 * (1 - cos(2πn / (L-1)))
+    hann = (
+        0.5 * (1 - torch.cos(2 * torch.pi * torch.arange(chunk_len, device=x_chunked.device) / (chunk_len - 1)))
+    ).float()
 
     for c in range(n_chunks):
         start = c * step
         end = start + chunk_len
         if end > T_time:
             end = T_time
-            start = max(0, end - chunk_len)  # 与 chunk 一致的末尾对齐
+            start = max(0, end - chunk_len)
         seg_len = end - start
         idx = c * n_traces
         seg = x_chunked[:, idx : idx + n_traces, :seg_len]
-        out[:, :, start:end] = out[:, :, start:end] + seg
-        count[:, :, start:end] = count[:, :, start:end] + 1.0
 
-    count = count.clamp(min=1.0)
-    out = out / count
+        # 根据实际长度截取窗函数（最后一段可能被截短）
+        window = hann[:seg_len].view(1, 1, -1)
+        out[:, :, start:end] = out[:, :, start:end] + seg * window
+        weight_sum[:, :, start:end] = weight_sum[:, :, start:end] + window
+
+    weight_sum = weight_sum.clamp(min=1e-6)
+    out = out / weight_sum
     return out
 
 

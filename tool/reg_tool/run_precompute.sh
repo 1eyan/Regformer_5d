@@ -18,8 +18,7 @@ RAW_H5="${RAW_H5:-${BASE_DIR}/field1031_irregular.h5}"
 REGULAR_H5="${REGULAR_H5:-${BASE_DIR}/field1031_label.h5}"
 TARGET_H5="${TARGET_H5:-${BASE_DIR}/field1031_mask.h5}"
 GROUP_KEY="${GROUP_KEY:-1551}"
-GROUP_KEY="${GROUP_KEY:-1551}"
-PATCH_DIR="${PATCH_DIR:-${BASE_DIR}/anchor_patch_e2e32}"
+PATCH_DIR="${PATCH_DIR:-${BASE_DIR}/anchor_patch_e2ev1}"
 
 # ── 训练参数 ──────────────────────────────────────────────────
 NUM_ANCHORS="${NUM_ANCHORS:-7896}"
@@ -32,6 +31,9 @@ SEED="${SEED:-0}"
 METRIC_WEIGHTS="${METRIC_WEIGHTS:-1.0,1.0,0.5,0.5}"
 TRAIN_ANCHOR_SELECTOR="${TRAIN_ANCHOR_SELECTOR:-value_based_anchor_sampling}"
 TRAIN_TRUSTED_SOURCE="${TRAIN_TRUSTED_SOURCE:-all}"
+TRAIN_MODE="${TRAIN_MODE:-block}"
+MIN_OBS_PER_BLOCK="${MIN_OBS_PER_BLOCK:-4}"
+BLOCK_POOL_MARGIN="${BLOCK_POOL_MARGIN:-1}"
 
 # ── 推理参数 ──────────────────────────────────────────────────
 BLOCK_DIVISORS="${BLOCK_DIVISORS:-6,21,7,5}"
@@ -61,6 +63,8 @@ ARGS=(
     --metric-weights        "${METRIC_WEIGHTS}"
     --train-anchor-selector "${TRAIN_ANCHOR_SELECTOR}"
     --train-trusted-source  "${TRAIN_TRUSTED_SOURCE}"
+    --train-mode            "${TRAIN_MODE}"
+    --min-obs-per-block     "${MIN_OBS_PER_BLOCK}"
     --block-divisors        "${_block_divs[@]}"
     --stride-divisors       "${_stride_divs[@]}"
     --query-mask-mode       "${QUERY_MASK_MODE}"
@@ -68,7 +72,7 @@ ARGS=(
     --gpu-query-chunk-size  "${GPU_QUERY_CHUNK_SIZE}"
     --infer-gpu-device      "${INFER_GPU_DEVICE}"
     --no-infer-use-gpu
-    --skip-train
+    --skip-infer
 )
 
 [[ -n "${NUM_ANCHORS}" ]] && ARGS+=(--num-anchors "${NUM_ANCHORS}")
