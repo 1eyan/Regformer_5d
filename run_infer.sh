@@ -24,7 +24,7 @@ H5_REGULAR="${H5_REGULAR:-${H5_DIR}/field1031_label.h5}"
 H5_MASK="${H5_MASK:-${H5_DIR}/field1031_mask.h5}"
 H5_TGT="${H5_TGT:-}"
 MASK_SEGY="${MASK_SEGY:-/data/shared/测试数据/mask_from_label.sgy}"
-DATASET_NEIGHBORS_INFER="${DATASET_NEIGHBORS_INFER:-/data/shared/测试数据/h5/anchor_patch_e2ev1/infer_query_context.npz}"
+DATASET_NEIGHBORS_INFER="${DATASET_NEIGHBORS_INFER:-/data/shared/测试数据/h5/anchor_patch_e2ev2/infer_query_context.npz}"
 LABEL_SEGY="${LABEL_SEGY:-/data/shared/测试数据/reg_pku_1031/reg_pku_1030/reg5dbin_label1031.sgy}"
 
 # ---- Output ----
@@ -50,7 +50,8 @@ D_MODEL="${D_MODEL:-768}"
 N_HEADS="${N_HEADS:-8}"
 NUM_LAYERS="${NUM_LAYERS:-6}"
 D_FF="${D_FF:-2048}"
-ROPE_FREQ_MODE="${ROPE_FREQ_MODE:-default}"
+# Note: checkpoint training_config.json will override this at runtime
+ROPE_FREQ_MODE="${ROPE_FREQ_MODE:-physical}"
 LAMBDA_PHYS_X="${LAMBDA_PHYS_X:-auto}"
 LAMBDA_PHYS_Y="${LAMBDA_PHYS_Y:-auto}"
 ROPE_NYQUIST_SAFETY="${ROPE_NYQUIST_SAFETY:-1.0}"

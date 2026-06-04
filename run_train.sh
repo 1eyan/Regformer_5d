@@ -15,30 +15,32 @@ NUM_GPUS="${NUM_GPUS:-8}"
 
 # ---- Training ----
 MODEL_NAME="${MODEL_NAME:-e2e_v9}"
-BATCH_SIZE="${BATCH_SIZE:-20}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-1e-4}"
 EPOCHS="${EPOCHS:-2500}"
 SEED="${SEED:-515}"
 DATA_TYPE="${DATA_TYPE:-df_field1031_5d}"
-RESULTS_DIR="${RESULTS_DIR:-./resultsE2E_selfV1_block}"
+RESULTS_DIR="${RESULTS_DIR:-./resultsE2E_selfV2_block}"
 
 # ---- Data ----
 H5_DIR="${H5_DIR:-/data/shared/测试数据/h5}"
 H5_FILE="${H5_FILE:-${H5_DIR}/field1031_irregular.h5}"
 H5_FILE_REGULAR="${H5_FILE_REGULAR:-${H5_DIR}/field1031_label.h5}"
 H5_FILE_TGT="${H5_FILE_TGT:-}"
-DATASET_NEIGHBORS_TRAIN="${DATASET_NEIGHBORS_TRAIN:-/data/shared/测试数据/h5/anchor_patch_e2ev1/train_pool_idx_2d_block.npz}"
+DATASET_NEIGHBORS_TRAIN="${DATASET_NEIGHBORS_TRAIN:-/data/shared/测试数据/h5/anchor_patch_e2ev2/train_pool_idx_2d_block.npz}"
 # 验证集 npz，从训练路径自动推导
 _default_val_npz="${DATASET_NEIGHBORS_TRAIN/train_pool_idx_2d_block.npz/infer_query_context.npz}"
 _default_val_npz="${_default_val_npz/train_pool_idx_2d.npz/infer_query_context.npz}"
 _default_val_npz="${_default_val_npz/train_pool_idx_2d_block_orig.npz/infer_query_context.npz}"
 DATASET_NEIGHBORS_VAL="${DATASET_NEIGHBORS_VAL:-$_default_val_npz}"
 TARGET_MODE="${TARGET_MODE:-self}"
+REGULAR_HOLDOUT_NPZ="${REGULAR_HOLDOUT_NPZ:-/data/shared/测试数据/h5/anchor_patch_e2ev2/train_regular_holdout_query_context.npz}"
+REGULAR_TASK_PROB="${REGULAR_TASK_PROB:-0.4}"
 
 # ---- Queryctx ----
 TRAIN_NUM_QUERY="${TRAIN_NUM_QUERY:-30}"
 TRAIN_CONTEXT_SIZE="${TRAIN_CONTEXT_SIZE:-}"
-PATCH_BETA="${PATCH_BETA:-0.5}"
+PATCH_BETA="${PATCH_BETA:-0.3}"
 FORCE_ANCHOR_QUERY="${FORCE_ANCHOR_QUERY:-false}"
 # Pool count is already very large (21,668), no need to repeat
 EPOCH_REPEAT="${EPOCH_REPEAT:-3}"
@@ -50,11 +52,11 @@ USE_P_SCALE="${USE_P_SCALE:-false}"
 CHUNK_LENGTH="${CHUNK_LENGTH:-256}"
 OVERLAP_RATIO="${OVERLAP_RATIO:-0.125}"
 QUERY_LOSS_WEIGHT="${QUERY_LOSS_WEIGHT:-1.0}"
-CONTEXT_LOSS_WEIGHT="${CONTEXT_LOSS_WEIGHT:-0.1}"
+CONTEXT_LOSS_WEIGHT="${CONTEXT_LOSS_WEIGHT:-0.0  1}"
 ENERGY_LOSS_WEIGHT="${ENERGY_LOSS_WEIGHT:-0.5}"
 HF_GRAD_LOSS_WEIGHT="${HF_GRAD_LOSS_WEIGHT:-0.1}"
 PHASE_LOSS_WEIGHT="${PHASE_LOSS_WEIGHT:-0.1}"
-COORD_AUG_SCALE="${COORD_AUG_SCALE:-0.01}"
+COORD_AUG_SCALE="${COORD_AUG_SCALE:-0.0}"
 
 # ---- V9 model ----
 D_MODEL="${D_MODEL:-768}"
@@ -132,6 +134,11 @@ fi
 
 if [[ -n "${TRAIN_CONTEXT_SIZE}" ]]; then
   cmd_args+=(--train_context_size "${TRAIN_CONTEXT_SIZE}")
+fi
+
+if [[ -n "${REGULAR_HOLDOUT_NPZ}" ]]; then
+  cmd_args+=(--regular_holdout_npz "${REGULAR_HOLDOUT_NPZ}")
+  cmd_args+=(--regular_task_prob "${REGULAR_TASK_PROB}")
 fi
 
 if [[ "${NUM_GPUS}" -gt 1 ]]; then

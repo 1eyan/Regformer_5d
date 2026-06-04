@@ -15,6 +15,7 @@ Key distinction from ``DatasetH5_all_queryctx``:
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+from pathlib import Path
 from h5py import File
 
 from utils.sampler_utils import diverse_topk
@@ -76,6 +77,7 @@ class DatasetH5Interp:
         trace_ps: int = 128,
         dt_ms: int = 4,
         t0_ms: int = 0,
+        allow_coord_stats_fallback: bool = False,
     ):
         super().__init__()
         print("Loading DatasetH5Interp...")
@@ -93,6 +95,7 @@ class DatasetH5Interp:
         self.patch_beta = float(patch_beta)
         self.patch_metric_weights = patch_metric_weights
         self.force_anchor_query = bool(force_anchor_query)
+        self.allow_coord_stats_fallback = bool(allow_coord_stats_fallback)
         if trace_sort_keys is None:
             trace_sort_keys = get_trace_sort_keys()
         self.trace_sort_keys = tuple(trace_sort_keys)
@@ -103,8 +106,8 @@ class DatasetH5Interp:
         self.h5_data = self._load_h5_group(self.h5File)
         print(self.h5_data["data"].shape)
 
-        self.coord_stats = self._compute_coord_stats()
-        print("coord_stats computed")
+        self.coord_stats = self._load_precomputed_norm_stats(dataset_neighbors)
+        print("coord_stats loaded")
 
         self.patch_meta = self._load_patch_metadata(dataset_neighbors)
         self.patch_mode = self.patch_meta["mode"]
@@ -279,11 +282,67 @@ class DatasetH5Interp:
 
     def _normalize_coords(self, sx, sy, rx, ry):
         stats = self.coord_stats
-        sx_n = 2.0 * (sx - stats["sx_min"]) / (stats["sx_max"] - stats["sx_min"]) - 1.0
-        sy_n = 2.0 * (sy - stats["sy_min"]) / (stats["sy_max"] - stats["sy_min"]) - 1.0
-        rx_n = 2.0 * (rx - stats["rx_min"]) / (stats["rx_max"] - stats["rx_min"]) - 1.0
-        ry_n = 2.0 * (ry - stats["ry_min"]) / (stats["ry_max"] - stats["ry_min"]) - 1.0
+        # Per-plane unified normalization
+        if "shot_scale" in stats:
+            sx_n = (sx - stats["shot_center"][0]) / stats["shot_scale"]
+            sy_n = (sy - stats["shot_center"][1]) / stats["shot_scale"]
+            rx_n = (rx - stats["recv_center"][0]) / stats["recv_scale"]
+            ry_n = (ry - stats["recv_center"][1]) / stats["recv_scale"]
+        else:
+            # Legacy per-axis normalization (fallback)
+            sx_n = 2.0 * (sx - stats["sx_min"]) / (stats["sx_max"] - stats["sx_min"]) - 1.0
+            sy_n = 2.0 * (sy - stats["sy_min"]) / (stats["sy_max"] - stats["sy_min"]) - 1.0
+            rx_n = 2.0 * (rx - stats["rx_min"]) / (stats["rx_max"] - stats["rx_min"]) - 1.0
+            ry_n = 2.0 * (ry - stats["ry_min"]) / (stats["ry_max"] - stats["ry_min"]) - 1.0
         return sx_n, sy_n, rx_n, ry_n
+
+    def _load_precomputed_norm_stats(self, dataset_neighbors_path):
+        """Load normalization parameters from coord_norm_stats.npz (saved by precompute)."""
+        if dataset_neighbors_path is None:
+            if self.allow_coord_stats_fallback:
+                print("[WARNING] dataset_neighbors is None, falling back to _compute_coord_stats")
+                return self._compute_coord_stats()
+            raise ValueError(
+                "dataset_neighbors is required for precomputed norm stats. "
+                "Pass --allow_coord_stats_fallback to use _compute_coord_stats instead."
+            )
+        patch_dir = Path(dataset_neighbors_path).parent
+        norm_path = patch_dir / "coord_norm_stats.npz"
+        if not norm_path.exists():
+            if self.allow_coord_stats_fallback:
+                print(f"[WARNING] {norm_path} not found, falling back to _compute_coord_stats")
+                return self._compute_coord_stats()
+            raise FileNotFoundError(
+                f"coord_norm_stats.npz not found at {norm_path}. "
+                "Re-run precompute or pass --allow_coord_stats_fallback."
+            )
+        data = np.load(norm_path)
+        if "shot_scale" not in data:
+            if self.allow_coord_stats_fallback:
+                print(f"[WARNING] {norm_path} missing per-plane fields, falling back")
+                return self._compute_coord_stats()
+            raise KeyError(
+                f"{norm_path} missing per-plane fields (shot_scale/recv_scale). "
+                "Re-run precompute or pass --allow_coord_stats_fallback."
+            )
+        stats = {
+            "shot_scale": float(data["shot_scale"]),
+            "recv_scale": float(data["recv_scale"]),
+            "shot_center": data["shot_center"].tolist(),
+            "recv_center": data["recv_center"].tolist(),
+            # Compatibility fields
+            "sx_min": float(data["shot_center"][0] - data["shot_scale"]),
+            "sx_max": float(data["shot_center"][0] + data["shot_scale"]),
+            "sy_min": float(data["shot_center"][1] - data["shot_scale"]),
+            "sy_max": float(data["shot_center"][1] + data["shot_scale"]),
+            "rx_min": float(data["recv_center"][0] - data["recv_scale"]),
+            "rx_max": float(data["recv_center"][0] + data["recv_scale"]),
+            "ry_min": float(data["recv_center"][1] - data["recv_scale"]),
+            "ry_max": float(data["recv_center"][1] + data["recv_scale"]),
+        }
+        for key in ("grid_step_sx", "grid_step_sy", "grid_step_rx", "grid_step_ry", "Lx", "Ly"):
+            stats[key] = float(data[key]) if key in data else None
+        return stats
 
     def _compute_coord_stats(self):
         sx_all = self.h5_data["sx"]

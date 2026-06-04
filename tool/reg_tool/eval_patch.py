@@ -939,7 +939,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--metric_weights",
         type=str,
-        default="1,1,0.5,0.5",
+        default="1,1,1,1",
         help="逗号分隔 4 个权重",
     )
     parser.add_argument("--beta", type=float, default=0.3)

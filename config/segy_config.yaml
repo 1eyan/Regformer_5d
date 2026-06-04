@@ -33,9 +33,9 @@ field1031:
     offset: 37
   key_columns: ["shot_line", "shot_stake", "recv_line", "recv_stake"]
   sort_keys: ["recv_line", "recv_stake", "shot_line", "shot_stake"]
-  trace_sort_keys: ["rx", "ry", "sx", "sy"]
+  trace_sort_keys: ["offset", "azimuth"]
   coord_col: {"sx": 0, "sy": 1, "rx": 2, "ry": 3}
-  metric_weights: [1.0, 1.0, 0.5, 0.5]
+  metric_weights: [1.0, 1.0, 1.0, 1.0]
 
 sw06:
   byte_pos:
@@ -54,9 +54,9 @@ sw06:
     offset: 37
   key_columns: ["shot_line", "shot_stake", "recv_line", "recv_stake"]
   sort_keys: ["recv_line", "recv_stake", "shot_line", "shot_stake"]
-  trace_sort_keys: ["rx", "ry", "sx", "sy"]
+  trace_sort_keys: ["offset", "azimuth"]
   coord_col: {"sx": 0, "sy": 1, "rx": 2, "ry": 3}
-  metric_weights: [1.0, 1.0, 0.5, 0.5]
+  metric_weights: [1.0, 1.0, 1.0, 1.0]
 
 # A002 field dataset (KN model format).
 # Byte positions from knmodel_header.json (non-standard layout).
@@ -105,9 +105,9 @@ a002:
     scalar: h
   key_columns: ["shot_line", "shot_stake", "recv_line", "recv_stake"]
   sort_keys: ["shot_line", "shot_stake", "recv_line", "recv_stake"]
-  trace_sort_keys: ["rx", "ry", "sx", "sy"]
+  trace_sort_keys: ["offset", "azimuth"]
   coord_col: {"sx": 0, "sy": 1, "rx": 2, "ry": 3}
-  metric_weights: [1.0, 1.0, 0.5, 0.5]
+  metric_weights: [1.0, 1.0, 1.0, 1.0]
 
 # Self-computed mode (coordinate-only, for segc3 data series)
 # In this mode, shot_line/shot_stake/recv_line/recv_stake are not read
@@ -124,6 +124,6 @@ segc3na:
     recv_no: 185
   key_columns: ["shot_line", "shot_no", "recv_line", "recv_no"]
   sort_keys: ["recv_line", "recv_no", "shot_line", "shot_no"]
-  trace_sort_keys: ["rx", "ry", "sx", "sy"]
+  trace_sort_keys: ["offset", "azimuth"]
   coord_col: {"sx": 0, "sy": 1, "rx": 2, "ry": 3}
-  metric_weights: [1.0, 1.0, 0.5, 0.5]
+  metric_weights: [1.0, 1.0, 1.0, 1.0]

@@ -93,7 +93,7 @@ _g.add_argument(
     "--trace_sort_keys",
     type=str,
     default="offset,azimuth",
-    help="Comma-separated coordinate sort order (offset,azimuth,sx,sy,rx,ry)",
+    help="Comma-separated coordinate sort order (offset,azimuth,rx,ry,sx,sy)",
 )
 _g.add_argument(
     "--epoch_repeat",
@@ -108,6 +108,26 @@ _g.add_argument(
     help="Use physics-based omega to set RoPE base frequency",
 )
 _g.add_argument("--use_p_scale", type=str2bool, default=True, help="Scale coordinates by p_scale")
+
+# ---- mixed dataset (regular holdout + raw irregular) ----
+_g.add_argument(
+    "--regular_holdout_npz",
+    type=str,
+    default=None,
+    help="Path to train_regular_holdout_query_context.npz (for mixed dataset)",
+)
+_g.add_argument(
+    "--regular_task_prob",
+    type=float,
+    default=0.3,
+    help="Probability of sampling from regular holdout pool in mixed dataset",
+)
+_g.add_argument(
+    "--allow_coord_stats_fallback",
+    type=str2bool,
+    default=False,
+    help="Allow fallback to compute_coord_stats if coord_norm_stats.npz is missing",
+)
 
 # ---- dataset_type (for switching) ----
 _g.add_argument(

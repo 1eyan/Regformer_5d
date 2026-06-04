@@ -34,6 +34,7 @@ def load_runtime_dependencies() -> None:
     global read_coord4, read_trace_data, read_regular_mask
     global _make_context_selector
     global _stable_unique_index_list
+    global diverse_topk
     global resolve_block_tuple
     global build_grid_index_map_4d_from_coord_grid
     global make_grid_blocks_from_index_map_4d
@@ -69,6 +70,7 @@ def load_runtime_dependencies() -> None:
         from .patch_sampler import (
             _make_context_selector as _make_context_selector,
             _stable_unique_index_list as _stable_unique_index_list,
+            diverse_topk as _diverse_topk,
             make_grid_blocks_from_index_map_4d as _make_grid_blocks_from_index_map_4d,
             normalize_coords as _normalize_coords,
             precompute_infer_patches_4d as _precompute_infer_patches_4d,
@@ -92,6 +94,7 @@ def load_runtime_dependencies() -> None:
         from patch_sampler import (
             _make_context_selector as _make_context_selector,
             _stable_unique_index_list as _stable_unique_index_list,
+            diverse_topk as _diverse_topk,
             make_grid_blocks_from_index_map_4d as _make_grid_blocks_from_index_map_4d,
             normalize_coords as _normalize_coords,
             precompute_infer_patches_4d as _precompute_infer_patches_4d,
@@ -107,6 +110,7 @@ def load_runtime_dependencies() -> None:
     read_regular_mask = _read_regular_mask
     _make_context_selector = _make_context_selector
     _stable_unique_index_list = _stable_unique_index_list
+    diverse_topk = _diverse_topk
     resolve_block_tuple = _resolve_block_tuple
     build_grid_index_map_4d_from_coord_grid = _build_grid_index_map_4d
     make_grid_blocks_from_index_map_4d = _make_grid_blocks_from_index_map_4d
@@ -161,7 +165,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pool-size", type=int, default=None)
     parser.add_argument("--beta", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--metric-weights", type=parse_metric_weights, default=(1.0, 1.0, 0.5, 0.5))
+    parser.add_argument("--metric-weights", type=parse_metric_weights, default=(1.0, 1.0, 1.0, 1.0))
     parser.add_argument(
         "--train-anchor-selector",
         choices=[
@@ -236,6 +240,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Expand block boundary by this many logical-grid cells when building training pool (block mode only). "
              "Use 1+ when stride==block_size (no overlap) to cover edge queries whose nearest context may fall in adjacent blocks.",
     )
+    parser.add_argument(
+        "--train-query-mask-mode",
+        choices=["regular_true", "regular_false", "all", "none"],
+        default="regular_true",
+        help="Query mask for training holdout: regular_true = holdout from observed grid points (has reliable targets).",
+    )
+    parser.add_argument(
+        "--grid-holdout-ratio",
+        type=float,
+        default=0.3,
+        help="Fraction of regular_true grid points per block used as holdout queries (block mode only).",
+    )
+    parser.add_argument(
+        "--emit-regular-holdout",
+        action="store_true",
+        help="In anchor mode, additionally emit train_regular_holdout_query_context.npz.",
+    )
+    parser.add_argument(
+        "--context-budget",
+        type=int,
+        default=None,
+        help="Hard cap on context size per holdout patch. Default=k_patch.",
+    )
     return parser
 
 
@@ -297,7 +324,30 @@ def main() -> None:
     print("raw_obs_valid true count:", int(raw_obs_valid.sum()))
 
     coord_obs_norm, coord_grid_norm, norm_stats = normalize_coords(coord_obs, coord_grid)
-    save_norm_stats(patch_dir / "coord_norm_stats.npz", norm_stats)
+
+    # compute grid_steps for physical RoPE
+    def _grid_step(arr):
+        u = np.sort(np.unique(arr))
+        if u.size < 2:
+            return None
+        d = np.diff(u)
+        d = d[d > 1e-9]
+        return float(np.median(d)) if d.size > 0 else None
+
+    gs_sx = _grid_step(coord_grid[:, 0])
+    gs_sy = _grid_step(coord_grid[:, 1])
+    gs_rx = _grid_step(coord_grid[:, 2])
+    gs_ry = _grid_step(coord_grid[:, 3])
+    Lx = float(max(coord_grid[:, 0].max() - coord_grid[:, 0].min(),
+                   coord_grid[:, 2].max() - coord_grid[:, 2].min()))
+    Ly = float(max(coord_grid[:, 1].max() - coord_grid[:, 1].min(),
+                   coord_grid[:, 3].max() - coord_grid[:, 3].min()))
+    grid_steps = {
+        "grid_step_sx": gs_sx, "grid_step_sy": gs_sy,
+        "grid_step_rx": gs_rx, "grid_step_ry": gs_ry,
+        "Lx": Lx if Lx > 0 else None, "Ly": Ly if Ly > 0 else None,
+    }
+    save_norm_stats(patch_dir / "coord_norm_stats.npz", norm_stats, grid_steps=grid_steps)
     np.save(patch_dir / "coord_obs_norm.npy", coord_obs_norm)
     np.save(patch_dir / "coord_grid_norm.npy", coord_grid_norm)
     print("coord_obs_norm range:", float(coord_obs_norm.min()), float(coord_obs_norm.max()))
@@ -354,19 +404,29 @@ def main() -> None:
         "metric_weights": metric_weights,
     }
 
+    # Build query masks (shared by train and infer branches)
+    train_query_mask = make_query_mask(
+        mode=args.train_query_mask_mode,
+        regular_mask=regular_mask,
+        n_grid=coord_grid.shape[0],
+    )
+    infer_query_mask = make_query_mask(
+        mode=args.query_mask_mode,
+        regular_mask=regular_mask,
+        n_grid=coord_grid.shape[0],
+    )
+    context_budget = int(args.context_budget) if args.context_budget is not None else k_patch
+
     if not args.skip_train:
         if args.train_mode == "block":
-            # ---- Block-based training pools (aligned with inference) ----
-            # Core idea: use the SAME context selection logic as inference.
-            # For each block, we compute the geometric center of raw obs inside it,
-            # then call _make_context_selector (identical to inference) to pick
-            # context from the global obs pool. The training pool is the union of:
-            #   (a) raw obs physically inside the block (query candidates)
-            #   (b) context selected by the inference-style selector (context candidates)
+            # ---- Block-based training: regular holdout query-context ----
+            # For each block, holdout a fraction of regular_true grid points as
+            # queries, select context from global obs pool (same as inference),
+            # inject margin raw obs, then apply leak prevention and hard budget.
+            # Output: train_regular_holdout_query_context.npz (infer_query_context schema)
             block_size = resolve_block_tuple(args.block_size, args.block_divisors, dims_4d, "block_size")
             stride = resolve_block_tuple(args.stride, args.stride_divisors, dims_4d, "stride")
 
-            # Map raw obs coordinates to 4D logical grid indices
             sx_levels = grid_info["sx_levels"]
             sy_levels = grid_info["sy_levels"]
             rx_levels = grid_info["rx_levels"]
@@ -376,12 +436,10 @@ def main() -> None:
             irx_obs = np.clip(np.searchsorted(rx_levels, coord_obs_norm[:, 2]), 0, len(rx_levels) - 1)
             iry_obs = np.clip(np.searchsorted(ry_levels, coord_obs_norm[:, 3]), 0, len(ry_levels) - 1)
 
-            # Reuse the exact same block generation as inference
             blocks = make_grid_blocks_from_index_map_4d(
                 grid_index_map_4d, block_size=block_size, stride=stride
             )
 
-            # Build context selector using EXACT SAME logic as inference
             select_contexts = _make_context_selector(
                 obs_coords=coord_obs_norm,
                 k_patch=k_patch,
@@ -392,20 +450,52 @@ def main() -> None:
                 use_gpu=False,
             )
 
-            pool_rows = []
-            anchor_indices = []
+            # Pre-build raw_key → obs_idx mapping for leak prevention
+            raw_key_to_obs = {}
+            for i in range(raw_keys.shape[0]):
+                key_t = tuple(raw_keys[i].tolist())
+                if key_t not in raw_key_to_obs:
+                    raw_key_to_obs[key_t] = []
+                raw_key_to_obs[key_t].append(i)
+
+            grid_query_list = []
+            context_list = []
+            anchor_list = []
             block_ids = []
+            center_ids = []
+
+            holdout_rng = np.random.default_rng(args.seed)
+
             for block in blocks:
                 point_idx = block["grid_point_indices"]
                 if point_idx.size == 0:
                     continue
 
-                # Map grid point coords back to logical indices via searchsorted
-                block_grid_coords = coord_grid_norm[point_idx]
-                isx = np.clip(np.searchsorted(sx_levels, block_grid_coords[:, 0]), 0, len(sx_levels) - 1)
-                isy = np.clip(np.searchsorted(sy_levels, block_grid_coords[:, 1]), 0, len(sy_levels) - 1)
-                irx = np.clip(np.searchsorted(rx_levels, block_grid_coords[:, 2]), 0, len(rx_levels) - 1)
-                iry = np.clip(np.searchsorted(ry_levels, block_grid_coords[:, 3]), 0, len(ry_levels) - 1)
+                # 1. Take regular_true grid points in this block (observed, have targets)
+                grid_true_in_block = point_idx[train_query_mask[point_idx]]
+                if grid_true_in_block.size == 0:
+                    continue
+
+                # 2. Holdout a fraction as queries
+                holdout_size = max(1, int(grid_true_in_block.size * args.grid_holdout_ratio))
+                holdout_idx = holdout_rng.choice(grid_true_in_block, holdout_size, replace=False)
+
+                # 3. Lexsort by 4D coordinates
+                block_grid_coords = coord_grid_norm[holdout_idx]
+                sort_order = np.lexsort([block_grid_coords[:, i] for i in (3, 2, 1, 0)])
+                sorted_query = holdout_idx[sort_order]
+
+                # 4. Chunk by max_query_per_patch
+                chunk_size = max(args.max_query_per_patch, 1)
+                n_chunks = max(1, (sorted_query.size + chunk_size - 1) // chunk_size)
+                chunks = np.array_split(sorted_query, n_chunks)
+
+                # 5. Take margin raw obs for context injection
+                block_grid_coords_all = coord_grid_norm[point_idx]
+                isx = np.clip(np.searchsorted(sx_levels, block_grid_coords_all[:, 0]), 0, len(sx_levels) - 1)
+                isy = np.clip(np.searchsorted(sy_levels, block_grid_coords_all[:, 1]), 0, len(sy_levels) - 1)
+                irx = np.clip(np.searchsorted(rx_levels, block_grid_coords_all[:, 2]), 0, len(rx_levels) - 1)
+                iry = np.clip(np.searchsorted(ry_levels, block_grid_coords_all[:, 3]), 0, len(ry_levels) - 1)
 
                 margin = int(args.block_pool_margin)
                 isx_min = max(0, int(isx.min()) - margin)
@@ -425,31 +515,14 @@ def main() -> None:
                 )
                 obs_in_block = np.flatnonzero(mask_in_block).astype(np.int64)
 
-                if obs_in_block.size < args.min_obs_per_block:
-                    continue
+                for chunk in chunks:
+                    if chunk.size == 0:
+                        continue
 
-                # Chunk obs_in_block into sub-groups to get region-specific anchors.
-                # This mirrors inference: different query chunks → different anchors → different contexts.
-                # Small blocks: single pool. Large blocks: multiple pools with diverse anchors.
-                chunk_size = max(args.min_obs_per_block, 32)
-                n_chunks = max(1, (obs_in_block.size + chunk_size - 1) // chunk_size)
-                n_chunks = min(n_chunks, 5)  # cap to avoid pool explosion
-                actual_chunk_size = (obs_in_block.size + n_chunks - 1) // n_chunks
+                    # anchor = chunk grid point mean (using coord_grid_norm)
+                    anchor_coord = np.mean(coord_grid_norm[chunk], axis=0).astype(np.float32)
 
-                rng = np.random.default_rng(args.seed + int(block["block_id"]))
-                perm = rng.permutation(obs_in_block.size)
-                shuffled_obs = obs_in_block[perm]
-
-                for ci in range(n_chunks):
-                    start = ci * actual_chunk_size
-                    end = min(start + actual_chunk_size, obs_in_block.size)
-                    chunk_obs = shuffled_obs[start:end]
-
-                    # Anchor = mean of this chunk's obs coords
-                    # (mirrors inference: anchor_coord = mean(query_coords))
-                    anchor_coord = np.mean(coord_obs_norm[chunk_obs], axis=0).astype(np.float32)
-
-                    # Select context using SAME method as inference
+                    # select context (same as inference)
                     context_batch = select_contexts(anchor_coord[None, :])
                     if len(context_batch) != 1:
                         raise RuntimeError(
@@ -457,30 +530,57 @@ def main() -> None:
                         )
                     context_idx = np.asarray(context_batch[0], dtype=np.int64).reshape(-1)
 
-                    # Pool = chunk obs ∪ context selected by inference logic
-                    pool_idx = _stable_unique_index_list([chunk_obs, context_idx])
+                    # Merge context + margin obs as candidates
+                    all_candidates = _stable_unique_index_list([context_idx, obs_in_block])
 
-                    if pool_idx.size >= args.min_obs_per_block:
-                        pool_rows.append(pool_idx)
-                        anchor_indices.append(int(block["block_center_grid_index"].item()))
-                        block_ids.append(int(block["block_id"]))
+                    # Leak prevention: exclude raw obs whose binning key matches
+                    # any held-out query grid key
+                    heldout_keys = set(tuple(reg_keys[g].tolist()) for g in chunk.tolist())
+                    leaked_obs = set()
+                    for hk in heldout_keys:
+                        if hk in raw_key_to_obs:
+                            leaked_obs.update(raw_key_to_obs[hk])
+                    safe_mask = np.ones(all_candidates.size, dtype=bool)
+                    for li, idx in enumerate(all_candidates.tolist()):
+                        if idx in leaked_obs:
+                            safe_mask[li] = False
+                    safe_candidates = all_candidates[safe_mask]
 
-            if not pool_rows:
-                raise ValueError("No valid block pools generated (all blocks have too few observations)")
+                    if safe_candidates.size == 0:
+                        continue
 
-            max_len = max(len(r) for r in pool_rows)
-            pool_idx_2d = np.full((len(pool_rows), max_len), -1, dtype=np.int64)
-            for i, row in enumerate(pool_rows):
-                pool_idx_2d[i, :len(row)] = row
+                    # Hard budget: diverse_topk selects back to context_budget
+                    final_context = diverse_topk(
+                        center_coord=anchor_coord,
+                        candidate_idx=safe_candidates,
+                        all_coords=coord_obs_norm,
+                        k=min(context_budget, safe_candidates.size),
+                        metric_weights=metric_weights,
+                        beta=args.beta,
+                    ).astype(np.int64)
+
+                    if final_context.size < args.min_obs_per_block:
+                        continue
+
+                    grid_query_list.append(chunk.astype(np.int64))
+                    context_list.append(final_context)
+                    anchor_list.append(np.asarray([int(chunk[len(chunk) // 2])], dtype=np.int64))
+                    block_ids.append(int(block["block_id"]))
+                    center_ids.append(int(block["block_center_grid_index"].item()))
+
+            if not grid_query_list:
+                raise ValueError("No valid block holdout patches generated")
 
             np.savez(
-                patch_dir / "train_pool_idx_2d_block.npz",
-                pool_idx_2d=pool_idx_2d,
-                anchor_idx=np.asarray(anchor_indices, dtype=np.int64),
+                patch_dir / "train_regular_holdout_query_context.npz",
+                grid_query_idx_list=object_array(grid_query_list),
+                context_idx_list=object_array(context_list),
                 block_id=np.asarray(block_ids, dtype=np.int64),
+                block_center_grid_idx=np.asarray(center_ids, dtype=np.int64),
+                anchor_grid_idx_list=object_array(anchor_list),
             )
-            print("train_pool_idx_2d_block:", pool_idx_2d.shape)
-            summary["train_pool_block_shape"] = [int(x) for x in pool_idx_2d.shape]
+            print("train_regular_holdout_query_context samples:", len(grid_query_list))
+            summary["train_holdout_samples"] = len(grid_query_list)
         else:
             # ---- Legacy anchor-based training pools ----
             if args.train_trusted_source == "all":
@@ -533,11 +633,6 @@ def main() -> None:
     if not args.skip_infer:
         block_size = resolve_block_tuple(args.block_size, args.block_divisors, dims_4d, "block_size")
         stride = resolve_block_tuple(args.stride, args.stride_divisors, dims_4d, "stride")
-        query_mask = make_query_mask(
-            mode=args.query_mask_mode,
-            regular_mask=regular_mask,
-            n_grid=coord_grid.shape[0],
-        )
         obs_valid_mask = None
         if args.infer_obs_valid_source == "regular_mask":
             obs_valid_mask = raw_obs_valid
@@ -545,8 +640,8 @@ def main() -> None:
         print("building infer patches")
         print("block_size:", block_size, "stride:", stride)
         print("query_mask_mode:", args.query_mask_mode)
-        if query_mask is not None:
-            print("query targets:", int(query_mask.sum()))
+        if infer_query_mask is not None:
+            print("query targets:", int(infer_query_mask.sum()))
         print("infer obs_valid source:", args.infer_obs_valid_source)
         infer_pack = precompute_infer_patches_4d(
             coord_obs_norm=coord_obs_norm,
@@ -558,7 +653,7 @@ def main() -> None:
             top_l=infer_top_l,
             metric_weights=metric_weights,
             beta=args.beta,
-            grid_query_mask=query_mask,
+            grid_query_mask=infer_query_mask,
             require_full_query_coverage=args.require_full_query_coverage,
             grid_index_map_4d=grid_index_map_4d,
             max_query_per_patch=args.max_query_per_patch,

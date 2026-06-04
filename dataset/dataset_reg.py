@@ -11,8 +11,9 @@ Dependencies:
     queryctx_module.utils.sampler_utils (diverse_topk, parse_metric_weights, weighted_sqdist_to_one)
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+from pathlib import Path
 from h5py import File
 from utils.sampler_utils import diverse_topk
 from config.data_config import object_args as _default_args
@@ -83,6 +84,9 @@ class DatasetH5_all_queryctx:
         coord_aug_scale: float = 0.0,
         dt_ms: int = 4,
         t0_ms: int = 0,
+        regular_holdout_npz: Optional[str] = None,
+        regular_task_prob: float = 0.3,
+        allow_coord_stats_fallback: bool = False,
     ):
         super().__init__()
         self.h5File = h5File
@@ -104,6 +108,7 @@ class DatasetH5_all_queryctx:
         self.force_anchor_query = bool(force_anchor_query)
         self.epoch_repeat = int(max(1, epoch_repeat))
         self.num_anchors = None  # set after metadata load for train_pool mode
+        self.allow_coord_stats_fallback = bool(allow_coord_stats_fallback)
 
         if trace_sort_keys is None:
             trace_sort_keys = get_trace_sort_keys()
@@ -122,11 +127,38 @@ class DatasetH5_all_queryctx:
         _safe_print(self.h5_data["data"].shape)
         _safe_print("loading data")
 
-        self.coord_stats = self.compute_coord_stats()
-        _safe_print("coord_stats computed")
+        self.coord_stats = self._load_precomputed_norm_stats(dataset_neighbors)
+        _safe_print("coord_stats loaded")
+
+        # use_p_scale conflict check
+        if self.use_p_scale and "shot_scale" in self.coord_stats:
+            raise ValueError(
+                "use_p_scale is incompatible with per_plane_unified normalization. "
+                "Set --use_p_scale false."
+            )
+
         self.patch_meta = self._load_patch_metadata(dataset_neighbors)
         self.patch_mode = self.patch_meta["mode"]
         _safe_print(self.patch_mode)
+
+        # Optional: holdout pool for mixed dataset
+        self.holdout_meta = None
+        self.regular_task_prob = 0.0
+        self.num_raw_samples = 0
+        self.num_holdout_samples = 0
+        if regular_holdout_npz is not None and self.train:
+            self.holdout_meta = self._load_patch_metadata(regular_holdout_npz)
+            if self.holdout_meta["mode"] != "infer_query_context":
+                raise ValueError(
+                    f"regular_holdout_npz must be infer_query_context format, "
+                    f"got {self.holdout_meta['mode']}"
+                )
+            self.regular_task_prob = float(regular_task_prob)
+            self.num_raw_samples = int(self.patch_meta["num_samples"])
+            self.num_holdout_samples = int(self.holdout_meta["num_samples"])
+            _safe_print(f"mixed dataset: raw={self.num_raw_samples}, holdout={self.num_holdout_samples}, "
+                        f"regular_task_prob={self.regular_task_prob}")
+
         base_samples = int(self.patch_meta["num_samples"])
         if self.train and self.patch_mode == "train_pool" and self.epoch_repeat > 1:
             self.num_anchors = base_samples
@@ -368,11 +400,68 @@ class DatasetH5_all_queryctx:
 
     def _normalize_coords(self, sx, sy, rx, ry) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         stats = self.coord_stats
-        sx_n = 2 * (sx - stats["sx_min"]) / (stats["sx_max"] - stats["sx_min"]) - 1
-        sy_n = 2 * (sy - stats["sy_min"]) / (stats["sy_max"] - stats["sy_min"]) - 1
-        rx_n = 2 * (rx - stats["rx_min"]) / (stats["rx_max"] - stats["rx_min"]) - 1
-        ry_n = 2 * (ry - stats["ry_min"]) / (stats["ry_max"] - stats["ry_min"]) - 1
+        # Per-plane unified normalization
+        if "shot_scale" in stats:
+            sx_n = (sx - stats["shot_center"][0]) / stats["shot_scale"]
+            sy_n = (sy - stats["shot_center"][1]) / stats["shot_scale"]
+            rx_n = (rx - stats["recv_center"][0]) / stats["recv_scale"]
+            ry_n = (ry - stats["recv_center"][1]) / stats["recv_scale"]
+        else:
+            # Legacy per-axis normalization (fallback)
+            sx_n = 2 * (sx - stats["sx_min"]) / (stats["sx_max"] - stats["sx_min"]) - 1
+            sy_n = 2 * (sy - stats["sy_min"]) / (stats["sy_max"] - stats["sy_min"]) - 1
+            rx_n = 2 * (rx - stats["rx_min"]) / (stats["rx_max"] - stats["rx_min"]) - 1
+            ry_n = 2 * (ry - stats["ry_min"]) / (stats["ry_max"] - stats["ry_min"]) - 1
         return sx_n, sy_n, rx_n, ry_n
+
+    def _load_precomputed_norm_stats(self, dataset_neighbors_path):
+        """Load normalization parameters from coord_norm_stats.npz (saved by precompute)."""
+        if dataset_neighbors_path is None:
+            if self.allow_coord_stats_fallback:
+                _safe_print("[WARNING] dataset_neighbors is None, falling back to compute_coord_stats")
+                return self.compute_coord_stats()
+            raise ValueError(
+                "dataset_neighbors is required for precomputed norm stats. "
+                "Pass --allow_coord_stats_fallback to use compute_coord_stats instead."
+            )
+        patch_dir = Path(dataset_neighbors_path).parent
+        norm_path = patch_dir / "coord_norm_stats.npz"
+        if not norm_path.exists():
+            if self.allow_coord_stats_fallback:
+                _safe_print(f"[WARNING] {norm_path} not found, falling back to compute_coord_stats")
+                return self.compute_coord_stats()
+            raise FileNotFoundError(
+                f"coord_norm_stats.npz not found at {norm_path}. "
+                "Re-run precompute or pass --allow_coord_stats_fallback."
+            )
+        data = np.load(norm_path)
+        if "shot_scale" not in data:
+            if self.allow_coord_stats_fallback:
+                _safe_print(f"[WARNING] {norm_path} missing per-plane fields, falling back")
+                return self.compute_coord_stats()
+            raise KeyError(
+                f"{norm_path} missing per-plane fields (shot_scale/recv_scale). "
+                "Re-run precompute or pass --allow_coord_stats_fallback."
+            )
+        stats = {
+            "shot_scale": float(data["shot_scale"]),
+            "recv_scale": float(data["recv_scale"]),
+            "shot_center": data["shot_center"].tolist(),
+            "recv_center": data["recv_center"].tolist(),
+            # Compatibility fields
+            "sx_min": float(data["shot_center"][0] - data["shot_scale"]),
+            "sx_max": float(data["shot_center"][0] + data["shot_scale"]),
+            "sy_min": float(data["shot_center"][1] - data["shot_scale"]),
+            "sy_max": float(data["shot_center"][1] + data["shot_scale"]),
+            "rx_min": float(data["recv_center"][0] - data["recv_scale"]),
+            "rx_max": float(data["recv_center"][0] + data["recv_scale"]),
+            "ry_min": float(data["recv_center"][1] - data["recv_scale"]),
+            "ry_max": float(data["recv_center"][1] + data["recv_scale"]),
+        }
+        # grid_step fields (needed for physical RoPE)
+        for key in ("grid_step_sx", "grid_step_sy", "grid_step_rx", "grid_step_ry", "Lx", "Ly"):
+            stats[key] = float(data[key]) if key in data else None
+        return stats
 
     def compute_coord_stats(self):
         sx_all = self.h5_data_regular["sx"]
@@ -553,9 +642,11 @@ class DatasetH5_all_queryctx:
     # Inference sample builder
     # ------------------------------------------------------------------
 
-    def _build_infer_query_context_sample(self, idx: int) -> Dict[str, Any]:
-        query_idx = self._index_row(self.patch_meta["grid_query_idx_list"], idx)
-        context_idx = self._index_row(self.patch_meta["context_idx_list"], idx)
+    def _build_infer_query_context_sample(self, idx: int, meta: Optional[Dict] = None) -> Dict[str, Any]:
+        if meta is None:
+            meta = self.patch_meta
+        query_idx = self._index_row(meta["grid_query_idx_list"], idx)
+        context_idx = self._index_row(meta["context_idx_list"], idx)
         if query_idx.size == 0 or context_idx.size == 0:
             raise RuntimeError("infer sample must contain non-empty query and context")
 
@@ -626,15 +717,15 @@ class DatasetH5_all_queryctx:
             "masked_patch_raw": masked_raw,
             **amplitude_metadata(thres),
         }
-        if self.patch_meta.get("block_id") is not None:
-            out["block_id"] = np.int64(np.asarray(self.patch_meta["block_id"])[idx])
-        if self.patch_meta.get("block_center_grid_idx") is not None:
+        if meta.get("block_id") is not None:
+            out["block_id"] = np.int64(np.asarray(meta["block_id"])[idx])
+        if meta.get("block_center_grid_idx") is not None:
             out["block_center_grid_idx"] = np.int64(
-                np.asarray(self.patch_meta["block_center_grid_idx"])[idx]
+                np.asarray(meta["block_center_grid_idx"])[idx]
             )
-        if self.patch_meta.get("anchor_grid_idx_list") is not None:
+        if meta.get("anchor_grid_idx_list") is not None:
             out["anchor_grid_idx"] = self._index_row(
-                self.patch_meta["anchor_grid_idx_list"], idx
+                meta["anchor_grid_idx_list"], idx
             )
         return out
 
@@ -643,6 +734,13 @@ class DatasetH5_all_queryctx:
     # ------------------------------------------------------------------
 
     def __getitem__(self, idx):
+        # Mixed dataset: sample from holdout pool with probability regular_task_prob
+        if self.holdout_meta is not None and self.train:
+            rng = self._sample_rng(idx)
+            if rng.random() < self.regular_task_prob:
+                holdout_idx = int(rng.integers(0, self.num_holdout_samples))
+                return self._build_infer_query_context_sample(holdout_idx, meta=self.holdout_meta)
+
         if self.patch_mode == "train_pool":
             return self._build_train_query_context_sample(idx)
 

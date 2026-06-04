@@ -893,6 +893,9 @@ def main() -> None:
             epoch_repeat=args.epoch_repeat,
             target_mode=args.target_mode,
             coord_aug_scale=args.coord_aug_scale,
+            regular_holdout_npz=getattr(args, "regular_holdout_npz", None),
+            regular_task_prob=getattr(args, "regular_task_prob", 0.3),
+            allow_coord_stats_fallback=getattr(args, "allow_coord_stats_fallback", False),
         )
         val_dataset = None
         if args.dataset_neighbors_test is not None:
@@ -907,6 +910,7 @@ def main() -> None:
                 time_ps=args.time_ps,
                 trace_ps=args.trace_ps,
                 target_mode="self",
+                allow_coord_stats_fallback=getattr(args, "allow_coord_stats_fallback", False),
             )
     finally:
         if rank != 0:

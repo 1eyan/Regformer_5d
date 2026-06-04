@@ -2310,7 +2310,7 @@ def demo_patch_sampler() -> None:
         coords=coord_obs_norm,
         candidate_idx=trusted_idx,
         num_anchors=16,
-        metric_weights=[1.0, 1.0, 0.5, 0.5],
+        metric_weights=[1.0, 1.0, 1.0, 1.0],
         seed=42,
     )
     print("num_anchors:", anchor_idx.size)
@@ -2322,7 +2322,7 @@ def demo_patch_sampler() -> None:
         k_patch=64,
         top_l=128,
         num_query=8,
-        metric_weights=[1.0, 1.0, 0.5, 0.5],
+        metric_weights=[1.0, 1.0, 1.0, 1.0],
         beta=0.3,
         seed=7,
     )
@@ -2345,7 +2345,7 @@ def demo_patch_sampler() -> None:
         trace_obs=trace_obs,
         k_patch=64,
         top_l=128,
-        metric_weights=[1.0, 1.0, 0.5, 0.5],
+        metric_weights=[1.0, 1.0, 1.0, 1.0],
         beta=0.3,
         return_features=True,
     )
@@ -2367,7 +2367,7 @@ def demo_patch_sampler() -> None:
             trace_obs=trace_obs,
             k_patch=64,
             top_l=128,
-            metric_weights=[1.0, 1.0, 0.5, 0.5],
+            metric_weights=[1.0, 1.0, 1.0, 1.0],
             beta=0.3,
             return_features=True,
         )
@@ -2391,7 +2391,7 @@ def demo_patch_sampler() -> None:
         model_predict_fn=_demo_dummy_model_predict,
         k_patch=64,
         top_l=128,
-        metric_weights=[1.0, 1.0, 0.5, 0.5],
+        metric_weights=[1.0, 1.0, 1.0, 1.0],
         beta=0.3,
     )
     final = finalize_predictions(

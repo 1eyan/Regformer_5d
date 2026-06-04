@@ -528,7 +528,16 @@ def make_query_mask(
     raise ValueError(f"unknown query mask mode: {mode}")
 
 
-def save_norm_stats(path: Path, stats: Dict[str, Dict[str, np.ndarray]]) -> None:
+def save_norm_stats(path: Path, stats: Dict[str, Dict[str, np.ndarray]],
+                    grid_steps: Optional[Dict[str, float]] = None) -> None:
+    """Save coordinate normalization stats to npz.
+
+    Args:
+        path: output path
+        stats: dict with 'obs', 'grid', and optionally 'normalization' keys
+        grid_steps: optional dict with grid_step_sx/sy/rx/ry and Lx/Ly
+            (needed for physical RoPE frequency computation)
+    """
     flat = {
         "obs_min": stats["obs"]["min"],
         "obs_max": stats["obs"]["max"],
@@ -539,9 +548,20 @@ def save_norm_stats(path: Path, stats: Dict[str, Dict[str, np.ndarray]]) -> None
         "grid_mean": stats["grid"]["mean"],
         "grid_std": stats["grid"]["std"],
     }
-    if "normalization" in stats:
-        flat["norm_min"] = stats["normalization"]["min"]
-        flat["norm_max"] = stats["normalization"]["max"]
+    norm = stats.get("normalization", {})
+    if "shot_scale" in norm:
+        flat["shot_scale"] = norm["shot_scale"]
+        flat["recv_scale"] = norm["recv_scale"]
+        flat["shot_center"] = norm["shot_center"]
+        flat["recv_center"] = norm["recv_center"]
+        flat["coord_norm_mode"] = "per_plane_unified"
+    elif "min" in norm:
+        flat["norm_min"] = norm["min"]
+        flat["norm_max"] = norm["max"]
+    if grid_steps is not None:
+        for k, v in grid_steps.items():
+            if v is not None:
+                flat[k] = np.float32(v)
     np.savez(path, **flat)
 
 
@@ -669,7 +689,7 @@ if __name__ == "__main__":
     parser.add_argument("--pool-size", type=int, default=None)
     parser.add_argument("--beta", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--metric_weights", type=str, default="1,1,0.5,0.5")
+    parser.add_argument("--metric_weights", type=str, default="1,1,1,1")
 
     # ---- Anchor selector ----
     parser.add_argument(
@@ -919,7 +939,35 @@ if __name__ == "__main__":
             
             # ── coordinate normalization ──
             coord_obs_norm, coord_grid_norm, norm_stats = normalize_coords(coord_obs, coord_grid)
-            save_norm_stats(Path(patch_dir) / "coord_norm_stats.npz", norm_stats)
+
+            # compute grid_steps for physical RoPE
+            def _grid_step(arr):
+                u = np.sort(np.unique(arr))
+                if u.size < 2:
+                    return None
+                d = np.diff(u)
+                d = d[d > 1e-9]
+                return float(np.median(d)) if d.size > 0 else None
+
+            gs_sx = _grid_step(coord_grid[:, 0])
+            gs_sy = _grid_step(coord_grid[:, 1])
+            gs_rx = _grid_step(coord_grid[:, 2])
+            gs_ry = _grid_step(coord_grid[:, 3])
+            gs_x_vals = [v for v in (gs_sx, gs_rx) if v is not None]
+            gs_y_vals = [v for v in (gs_sy, gs_ry) if v is not None]
+            Lx = float(max(coord_grid[:, 0].max() - coord_grid[:, 0].min(),
+                           coord_grid[:, 2].max() - coord_grid[:, 2].min()))
+            Ly = float(max(coord_grid[:, 1].max() - coord_grid[:, 1].min(),
+                           coord_grid[:, 3].max() - coord_grid[:, 3].min()))
+            grid_steps = {
+                "grid_step_sx": gs_sx,
+                "grid_step_sy": gs_sy,
+                "grid_step_rx": gs_rx,
+                "grid_step_ry": gs_ry,
+                "Lx": Lx if Lx > 0 else None,
+                "Ly": Ly if Ly > 0 else None,
+            }
+            save_norm_stats(Path(patch_dir) / "coord_norm_stats.npz", norm_stats, grid_steps=grid_steps)
             np.save(os.path.join(patch_dir, "coord_obs_norm.npy"), coord_obs_norm)
             np.save(os.path.join(patch_dir, "coord_grid_norm.npy"), coord_grid_norm)
             print("coord_obs_norm range:", float(coord_obs_norm.min()), float(coord_obs_norm.max()))
