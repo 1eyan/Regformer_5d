@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--elementwise_attn_output_gate", type=str2bool, default=True)
     parser.add_argument("--headwise_attn_output_gate", type=str2bool, default=False)
-    parser.add_argument("--use_qk_norm", type=str2bool, default=False)
+    parser.add_argument("--use_qk_norm", type=str2bool, default=True)
     parser.add_argument("--qkv_bias", type=str2bool, default=False)
     parser.add_argument("--rms_norm_eps", type=float, default=1e-8)
     parser.add_argument("--hidden_act", type=str, default="gelu")
@@ -958,7 +958,7 @@ class Trainer:
 
 def main() -> None:
     args = parse_args()
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         gradient_accumulation_steps=1,
         mixed_precision=None if args.mixed_precision == "no" else args.mixed_precision,
