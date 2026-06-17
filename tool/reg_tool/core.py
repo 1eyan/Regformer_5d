@@ -528,16 +528,7 @@ def make_query_mask(
     raise ValueError(f"unknown query mask mode: {mode}")
 
 
-def save_norm_stats(path: Path, stats: Dict[str, Dict[str, np.ndarray]],
-                    grid_steps: Optional[Dict[str, float]] = None) -> None:
-    """Save coordinate normalization stats to npz.
-
-    Args:
-        path: output path
-        stats: dict with 'obs', 'grid', and optionally 'normalization' keys
-        grid_steps: optional dict with grid_step_sx/sy/rx/ry and Lx/Ly
-            (needed for physical RoPE frequency computation)
-    """
+def save_norm_stats(path: Path, stats: Dict[str, Dict[str, np.ndarray]]) -> None:
     flat = {
         "obs_min": stats["obs"]["min"],
         "obs_max": stats["obs"]["max"],
@@ -548,20 +539,6 @@ def save_norm_stats(path: Path, stats: Dict[str, Dict[str, np.ndarray]],
         "grid_mean": stats["grid"]["mean"],
         "grid_std": stats["grid"]["std"],
     }
-    norm = stats.get("normalization", {})
-    if "shot_scale" in norm:
-        flat["shot_scale"] = norm["shot_scale"]
-        flat["recv_scale"] = norm["recv_scale"]
-        flat["shot_center"] = norm["shot_center"]
-        flat["recv_center"] = norm["recv_center"]
-        flat["coord_norm_mode"] = "per_plane_unified"
-    elif "min" in norm:
-        flat["norm_min"] = norm["min"]
-        flat["norm_max"] = norm["max"]
-    if grid_steps is not None:
-        for k, v in grid_steps.items():
-            if v is not None:
-                flat[k] = np.float32(v)
     np.savez(path, **flat)
 
 
@@ -689,7 +666,7 @@ if __name__ == "__main__":
     parser.add_argument("--pool-size", type=int, default=None)
     parser.add_argument("--beta", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--metric_weights", type=str, default="1,1,1,1")
+    parser.add_argument("--metric_weights", type=str, default="1,1,0.5,0.5")
 
     # ---- Anchor selector ----
     parser.add_argument(
@@ -719,10 +696,10 @@ if __name__ == "__main__":
     parser.add_argument("--stride-divisors", type=int, nargs=4, default=(6, 21, 7, 5))
     parser.add_argument("--on-grid-collision", choices=["raise", "last"], default="raise")
     parser.add_argument("--query-mask-mode", choices=["regular_true", "regular_false", "all", "none"],
-                        default="regular_false")
+                        default="regular_true")
     parser.add_argument("--infer-obs-valid-source", choices=["none", "regular_mask"], default="none")
     parser.add_argument("--infer-top-l", type=int, default=None, help="auto as k_patch * 2 if None")
-    parser.add_argument("--max-query-per-patch", type=int, default=32)
+    parser.add_argument("--max-query-per-patch", type=int, default=128)
     parser.add_argument("--gpu-query-chunk-size", type=int, default=128)
     parser.add_argument("--infer-gpu-device", type=str, default="cuda:0")
     parser.add_argument("--infer-use-gpu", action=argparse.BooleanOptionalAction, default=False)
@@ -896,12 +873,15 @@ if __name__ == "__main__":
 
             # ── optional key-mean aggregation ──
             if args.raw_key_aggregate == "mean":
-                raise ValueError(
-                    "--raw_key_aggregate=mean is incompatible with queryctx npz outputs "
-                    "unless you also write and train/infer against an aggregated irregular H5. "
-                    "The saved context indices would otherwise refer to aggregated rows, while "
-                    "DatasetH5_all_queryctx interprets them as original irregular-H5 row indices. "
-                    "Use --raw_key_aggregate none for patch files consumed by the current dataset."
+                trace_obs, coord_obs, obs_keys, key_counts = _aggregate_raw_by_keys_mean(
+                    trace_obs=trace_obs_raw,
+                    coord_obs=coord_obs_raw,
+                    raw_keys=raw_keys,
+                )
+                np.save(os.path.join(patch_dir, "raw_key_counts.npy"), key_counts)
+                print(
+                    "raw key-mean aggregation:",
+                    f"before={trace_obs_raw.shape[0]} after={trace_obs.shape[0]}",
                 )
             else:
                 trace_obs = trace_obs_raw
@@ -939,35 +919,7 @@ if __name__ == "__main__":
             
             # ── coordinate normalization ──
             coord_obs_norm, coord_grid_norm, norm_stats = normalize_coords(coord_obs, coord_grid)
-
-            # compute grid_steps for physical RoPE
-            def _grid_step(arr):
-                u = np.sort(np.unique(arr))
-                if u.size < 2:
-                    return None
-                d = np.diff(u)
-                d = d[d > 1e-9]
-                return float(np.median(d)) if d.size > 0 else None
-
-            gs_sx = _grid_step(coord_grid[:, 0])
-            gs_sy = _grid_step(coord_grid[:, 1])
-            gs_rx = _grid_step(coord_grid[:, 2])
-            gs_ry = _grid_step(coord_grid[:, 3])
-            gs_x_vals = [v for v in (gs_sx, gs_rx) if v is not None]
-            gs_y_vals = [v for v in (gs_sy, gs_ry) if v is not None]
-            Lx = float(max(coord_grid[:, 0].max() - coord_grid[:, 0].min(),
-                           coord_grid[:, 2].max() - coord_grid[:, 2].min()))
-            Ly = float(max(coord_grid[:, 1].max() - coord_grid[:, 1].min(),
-                           coord_grid[:, 3].max() - coord_grid[:, 3].min()))
-            grid_steps = {
-                "grid_step_sx": gs_sx,
-                "grid_step_sy": gs_sy,
-                "grid_step_rx": gs_rx,
-                "grid_step_ry": gs_ry,
-                "Lx": Lx if Lx > 0 else None,
-                "Ly": Ly if Ly > 0 else None,
-            }
-            save_norm_stats(Path(patch_dir) / "coord_norm_stats.npz", norm_stats, grid_steps=grid_steps)
+            save_norm_stats(Path(patch_dir) / "coord_norm_stats.npz", norm_stats)
             np.save(os.path.join(patch_dir, "coord_obs_norm.npy"), coord_obs_norm)
             np.save(os.path.join(patch_dir, "coord_grid_norm.npy"), coord_grid_norm)
             print("coord_obs_norm range:", float(coord_obs_norm.min()), float(coord_obs_norm.max()))

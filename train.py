@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import inspect
 import json
 import os
 import random
@@ -33,13 +32,7 @@ from tqdm import tqdm
 from config.data_config import get_parser
 from config.segy_config import print_info as print_segy_config
 from dataset import DatasetH5_all_queryctx
-from model import (
-    create_gated_model_v9,
-    create_gated_model_v9_encdec,
-    create_gated_model_v10,
-    trace_time_chunk,
-    trace_time_unchunk,
-)
+from model import create_gated_model_v9_encdec, trace_time_chunk, trace_time_unchunk
 from utils.coord_utils import build_rope_frequency_config
 
 
@@ -66,11 +59,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(parents=[get_parser()], conflict_handler="resolve")
 
     parser.add_argument("--model_name", type=str, default="e2e_v9")
-    parser.add_argument(
-        "--model_type",
-        choices=["e2e_encdec_v9", "e2e_v9_dense", "e2e_v10"],
-        default="e2e_encdec_v9",
-    )
     parser.add_argument("--batch_size", type=int, default=8, help="batch size per GPU")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=200)
@@ -93,10 +81,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy_loss_weight", type=float, default=2.0)
     parser.add_argument("--hf_grad_loss_weight", type=float, default=0.2)
     parser.add_argument("--phase_loss_weight", type=float, default=0.0)
-    parser.add_argument("--coord_aug_scale", type=float, default=0.0,
-                        help="Conservative coord augmentation magnitude in normalized [-1,1] coords "
-                             "(bounded shared translation + small jitter). "
-                             "0=disabled (default). Suggested: 0.005~0.03")
 
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_heads", type=int, default=8)
@@ -107,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--elementwise_attn_output_gate", type=str2bool, default=True)
     parser.add_argument("--headwise_attn_output_gate", type=str2bool, default=False)
-    parser.add_argument("--use_qk_norm", type=str2bool, default=True)
+    parser.add_argument("--use_qk_norm", type=str2bool, default=False)
     parser.add_argument("--qkv_bias", type=str2bool, default=False)
     parser.add_argument("--rms_norm_eps", type=float, default=1e-8)
     parser.add_argument("--hidden_act", type=str, default="gelu")
@@ -118,13 +102,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encode_observed_only", type=str2bool, default=True,
                         help="If True, encoder only processes observed tokens; "
                              "if False, encoder processes the full sequence.")
-    parser.add_argument("--use_local_query_attention", type=str2bool, default=True)
-    parser.add_argument("--query_local_k", type=int, default=8)
-    parser.add_argument("--query_local_same_time", type=str2bool, default=True)
-    parser.add_argument("--use_query_refinement", type=str2bool, default=True)
-    parser.add_argument("--refine_query_k", type=int, default=8)
-    parser.add_argument("--refine_context_k", type=int, default=16)
-    parser.add_argument("--refine_gamma_init", type=float, default=0.0)
     parser.add_argument("--rope_freq_mode", choices=["default", "physical"], default="default")
     parser.add_argument("--lambda_phys_x", type=optional_float, default=None)
     parser.add_argument("--lambda_phys_y", type=optional_float, default=None)
@@ -191,41 +168,6 @@ def coords01_from_batch(batch: Dict[str, torch.Tensor], device: torch.device) ->
 
 def repeat_trace_mask_for_chunks(mask: torch.Tensor, n_chunks: int) -> torch.Tensor:
     return mask.float().repeat(1, int(n_chunks))
-
-
-def model_accepts_valid_mask(model: torch.nn.Module) -> bool:
-    forward = getattr(model, "forward", None)
-    if forward is None:
-        return False
-    try:
-        return "valid_mask" in inspect.signature(forward).parameters
-    except (TypeError, ValueError):
-        return bool(getattr(model, "accepts_valid_mask", True))
-
-
-def run_model_forward(
-    model: torch.nn.Module,
-    x_chunk: torch.Tensor,
-    coords_chunk: torch.Tensor,
-    time_bounds: torch.Tensor,
-    observed_token: torch.Tensor,
-    valid_token: torch.Tensor,
-    model_type: str | None = None,
-) -> torch.Tensor:
-    use_valid_mask = (
-        model_accepts_valid_mask(model)
-        if model_type is None
-        else model_type != "e2e_v9_dense"
-    )
-    if use_valid_mask:
-        return model(
-            x_chunk,
-            coords_chunk,
-            time_bounds,
-            mask=observed_token,
-            valid_mask=valid_token,
-        )
-    return model(x_chunk, coords_chunk, time_bounds, mask=observed_token)
 
 
 def _weighted_token_mean(
@@ -355,15 +297,7 @@ def forward_loss(
         token_weight = valid_token
 
     time_bounds = time_bounds.to(device).float() / max(float(chunk_info["time_length"]), 1.0)
-    pred = run_model_forward(
-        model,
-        x_chunk,
-        coords_chunk,
-        time_bounds,
-        observed_token,
-        valid_token,
-        args.model_type,
-    )
+    pred = model(x_chunk, coords_chunk, time_bounds, mask=observed_token, valid_mask=valid_token)
     mse_loss = weighted_time_mse(pred, target_chunk, token_weight)
     energy_loss = weighted_energy_mse(pred, target_chunk, token_weight)
     grad_loss = weighted_time_gradient_mse(pred, target_chunk, token_weight)
@@ -388,11 +322,13 @@ def forward_loss(
 
 
 def build_model(args: argparse.Namespace) -> torch.nn.Module:
-    common = dict(
+    return create_gated_model_v9_encdec(
         input_dim=args.chunk_length,
         d_model=args.d_model,
         n_heads=args.n_heads,
         num_layers=args.num_layers,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
         d_ff=args.d_ff,
         dropout=args.dropout,
         output_dim=args.chunk_length,
@@ -406,34 +342,8 @@ def build_model(args: argparse.Namespace) -> torch.nn.Module:
         use_rope=args.use_rope,
         coord_dim=args.coord_dim,
         num_attn_res_blocks=args.num_attn_res_blocks,
-        rope_omega_bands=getattr(args, "rope_omega_bands", None),
-    )
-    if args.model_type == "e2e_v9_dense":
-        model = create_gated_model_v9(
-            **common,
-            use_attn_res=True,
-        )
-        model.accepts_valid_mask = False
-        return model
-    if args.model_type == "e2e_v10":
-        return create_gated_model_v10(
-            **common,
-            num_encoder_layers=args.num_encoder_layers,
-            num_decoder_layers=args.num_decoder_layers,
-            encode_observed_only=args.encode_observed_only,
-            use_local_query_attention=args.use_local_query_attention,
-            query_local_k=args.query_local_k,
-            query_local_same_time=args.query_local_same_time,
-            use_query_refinement=args.use_query_refinement,
-            refine_query_k=args.refine_query_k,
-            refine_context_k=args.refine_context_k,
-            refine_gamma_init=args.refine_gamma_init,
-        )
-    return create_gated_model_v9_encdec(
-        **common,
-        num_encoder_layers=args.num_encoder_layers,
-        num_decoder_layers=args.num_decoder_layers,
         encode_observed_only=args.encode_observed_only,
+        rope_omega_bands=getattr(args, "rope_omega_bands", None),
     )
 
 
@@ -580,8 +490,7 @@ class Trainer:
         self._log("-" * 40)
         self._log("Model Config")
         self._log("-" * 40)
-        self._log(f"  Architecture:    {type(self.accelerator.unwrap_model(self.model)).__name__}")
-        self._log(f"  model_type:      {args.model_type}")
+        self._log(f"  Architecture:    GatedSeismicInterpolationTransformerV9EncDec")
         self._log(f"  d_model:         {args.d_model}")
         self._log(f"  n_heads:         {args.n_heads}  (head_dim={head_dim})")
         self._log(f"  num_enc_layers:  {args.num_encoder_layers or args.num_layers}")
@@ -594,9 +503,6 @@ class Trainer:
         self._log(f"  elementwise_gate:{args.elementwise_attn_output_gate}")
         self._log(f"  use_qk_norm:     {args.use_qk_norm}")
         self._log(f"  encode_obs_only: {args.encode_observed_only}")
-        if args.model_type == "e2e_v10":
-            self._log(f"  query_local_k:   {args.query_local_k}")
-            self._log(f"  refine_q/context:{args.refine_query_k}/{args.refine_context_k}")
         self._log(f"  Total params:    {n_params:,}")
         self._log(f"  Trainable params:{trainable_params:,}")
 
@@ -669,7 +575,6 @@ class Trainer:
     def _save_training_config(self) -> None:
         ds = self.dl.dataset
         world_size = self.accelerator.num_processes
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
         cfg = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "environment": {
@@ -680,8 +585,8 @@ class Trainer:
             },
             "training_args": vars(self.args),
             "model": {
-                "class": type(unwrapped_model).__name__,
-                "model_type": self.args.model_type,
+                "class": "GatedSeismicInterpolationTransformerV9EncDec",
+                "model_type": "e2e_encdec_v9",
                 "input_dim": self.args.chunk_length,
                 "d_model": self.args.d_model,
                 "n_heads": self.args.n_heads,
@@ -691,15 +596,8 @@ class Trainer:
                 "d_ff": self.args.d_ff,
                 "dropout": self.args.dropout,
                 "encode_observed_only": self.args.encode_observed_only,
-                "use_local_query_attention": self.args.use_local_query_attention,
-                "query_local_k": self.args.query_local_k,
-                "query_local_same_time": self.args.query_local_same_time,
-                "use_query_refinement": self.args.use_query_refinement,
-                "refine_query_k": self.args.refine_query_k,
-                "refine_context_k": self.args.refine_context_k,
-                "refine_gamma_init": self.args.refine_gamma_init,
-                "total_params": sum(p.numel() for p in unwrapped_model.parameters()),
-                "trainable_params": sum(p.numel() for p in unwrapped_model.parameters() if p.requires_grad),
+                "total_params": sum(p.numel() for p in self.model.parameters()),
+                "trainable_params": sum(p.numel() for p in self.model.parameters() if p.requires_grad),
             },
             "dataloader": {
                 "batch_size_per_gpu": self.args.batch_size,
@@ -799,15 +697,8 @@ class Trainer:
             time_bounds_norm = time_bounds.to(self.device).float() / max(float(chunk_info["time_length"]), 1.0)
 
             with self.accelerator.autocast():
-                pred_chunk = run_model_forward(
-                    self.model,
-                    x_chunk,
-                    coords_chunk,
-                    time_bounds_norm,
-                    observed_token,
-                    valid_token,
-                    self.args.model_type,
-                )
+                pred_chunk = self.model(x_chunk, coords_chunk, time_bounds_norm,
+                                         mask=observed_token, valid_mask=valid_token)
             pred = trace_time_unchunk(pred_chunk.float(), chunk_info).cpu().numpy()
             target = x_gt.cpu().numpy()
             inp = x_obs.cpu().numpy()
@@ -958,7 +849,7 @@ class Trainer:
 
 def main() -> None:
     args = parse_args()
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=1,
         mixed_precision=None if args.mixed_precision == "no" else args.mixed_precision,
@@ -997,26 +888,7 @@ def main() -> None:
             trace_ps=args.trace_ps,
             epoch_repeat=args.epoch_repeat,
             target_mode=args.target_mode,
-            coord_aug_scale=args.coord_aug_scale,
-            regular_holdout_npz=getattr(args, "regular_holdout_npz", None),
-            regular_task_prob=getattr(args, "regular_task_prob", 0.3),
-            allow_coord_stats_fallback=getattr(args, "allow_coord_stats_fallback", False),
         )
-        val_dataset = None
-        if args.dataset_neighbors_test is not None:
-            val_dataset = DatasetH5_all_queryctx(
-                h5File=args.h5File,
-                h5File_regular=args.h5File_regular,
-                h5File_tgt=args.h5File_tgt,
-                dataset_neighbors=args.dataset_neighbors_test,
-                train=False,
-                trace_sort_keys=trace_sort_keys,
-                use_p_scale=args.use_p_scale,
-                time_ps=args.time_ps,
-                trace_ps=args.trace_ps,
-                target_mode="self",
-                allow_coord_stats_fallback=getattr(args, "allow_coord_stats_fallback", False),
-            )
     finally:
         if rank != 0:
             sys.stdout.close()
@@ -1025,7 +897,7 @@ def main() -> None:
     if rank == 0:
         sample0 = dataset[0]
         print(
-            f"[{args.model_type}] target_mode={args.target_mode} "
+            f"[e2e_v9] target_mode={args.target_mode} "
             f"time_ps={dataset.time_ps} trace_ps={dataset.trace_ps} "
             f"sample_shape={sample0['data'].shape} samples={len(dataset)}"
         )
@@ -1033,16 +905,15 @@ def main() -> None:
     rope_cfg = prepare_rope_frequency(args, dataset)
     if rank == 0:
         print(
-            f"[{args.model_type}] rope_freq_mode={rope_cfg['rope_freq_mode']} "
+            f"[e2e_v9] rope_freq_mode={rope_cfg['rope_freq_mode']} "
             f"n_freqs={rope_cfg['n_freqs']} "
             f"warnings={len(rope_cfg.get('warnings', []))}"
         )
         for warning in rope_cfg.get("warnings", []):
-            print(f"[{args.model_type}][rope] {warning}")
+            print(f"[e2e_v9][rope] {warning}")
 
     train_sampler = DistributedSampler(dataset) if world_size > 1 else None
-    val_ds = val_dataset if val_dataset is not None else dataset
-    val_sampler = DistributedSampler(val_ds, shuffle=False) if world_size > 1 else None
+    val_sampler = DistributedSampler(dataset, shuffle=False) if world_size > 1 else None
     dl = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -1053,7 +924,7 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
     val_dl = DataLoader(
-        val_ds,
+        dataset,
         batch_size=1,
         shuffle=False,
         num_workers=max(0, min(args.num_workers, 2)),

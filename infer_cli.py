@@ -25,7 +25,7 @@ from config.segy_config import (
 )
 from dataset import DatasetH5_all_queryctx
 from infer import fit_trace, run_queryctx_inference
-from model import create_gated_model_v9, create_gated_model_v9_encdec, create_gated_model_v10
+from model import create_gated_model_v9_encdec
 from utils.coord_utils import build_rope_frequency_config
 from utils import (
     build_lookup,
@@ -133,11 +133,8 @@ def apply_training_config(args: argparse.Namespace, train_cfg: Dict[str, Any]) -
         "d_ff",
         "coord_dim",
         "num_attn_res_blocks",
-        "query_local_k",
-        "refine_query_k",
-        "refine_context_k",
     ]
-    float_keys = ["overlap_ratio", "dropout", "rms_norm_eps", "refine_gamma_init"]
+    float_keys = ["overlap_ratio", "dropout", "rms_norm_eps"]
     bool_keys = [
         "elementwise_attn_output_gate",
         "headwise_attn_output_gate",
@@ -147,13 +144,7 @@ def apply_training_config(args: argparse.Namespace, train_cfg: Dict[str, Any]) -
         "use_rope",
         "use_p_scale",
         "encode_observed_only",
-        "use_local_query_attention",
-        "query_local_same_time",
-        "use_query_refinement",
     ]
-    model_type = _first_of("model_type", cfg=train_cfg)
-    if model_type is not None:
-        args.model_type = str(model_type)
     for key in int_keys:
         value = _first_of(key, cfg=train_cfg)
         if value is not None:
@@ -169,7 +160,7 @@ def apply_training_config(args: argparse.Namespace, train_cfg: Dict[str, Any]) -
     for key in bool_keys:
         value = _first_of(key, cfg=train_cfg)
         if value is not None:
-            setattr(args, key, str2bool(value) if isinstance(value, str) else bool(value))
+            setattr(args, key, bool(value))
 
     for key in ("num_encoder_layers", "num_decoder_layers"):
         value = _first_of(key, cfg=train_cfg)
@@ -201,11 +192,13 @@ def apply_training_config(args: argparse.Namespace, train_cfg: Dict[str, Any]) -
 
 
 def build_model(args: argparse.Namespace) -> torch.nn.Module:
-    common = dict(
+    return create_gated_model_v9_encdec(
         input_dim=args.chunk_length,
         d_model=args.d_model,
         n_heads=args.n_heads,
         num_layers=args.num_layers,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
         d_ff=args.d_ff,
         dropout=args.dropout,
         output_dim=args.chunk_length,
@@ -220,33 +213,6 @@ def build_model(args: argparse.Namespace) -> torch.nn.Module:
         coord_dim=args.coord_dim,
         num_attn_res_blocks=args.num_attn_res_blocks,
         rope_omega_bands=getattr(args, "rope_omega_bands", None),
-    )
-    if args.model_type == "e2e_v9_dense":
-        model = create_gated_model_v9(
-            **common,
-            use_attn_res=True,
-        )
-        model.accepts_valid_mask = False
-        return model
-    if args.model_type == "e2e_v10":
-        return create_gated_model_v10(
-            **common,
-            num_encoder_layers=args.num_encoder_layers,
-            num_decoder_layers=args.num_decoder_layers,
-            encode_observed_only=args.encode_observed_only,
-            use_local_query_attention=args.use_local_query_attention,
-            query_local_k=args.query_local_k,
-            query_local_same_time=args.query_local_same_time,
-            use_query_refinement=args.use_query_refinement,
-            refine_query_k=args.refine_query_k,
-            refine_context_k=args.refine_context_k,
-            refine_gamma_init=args.refine_gamma_init,
-        )
-    return create_gated_model_v9_encdec(
-        **common,
-        num_encoder_layers=args.num_encoder_layers,
-        num_decoder_layers=args.num_decoder_layers,
-        encode_observed_only=args.encode_observed_only,
     )
 
 
@@ -483,11 +449,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--non_strict_load", dest="strict_load", action="store_false")
     parser.add_argument("--strict_fill", action="store_true", default=False)
 
-    parser.add_argument(
-        "--model_type",
-        choices=["e2e_encdec_v9", "e2e_v9_dense", "e2e_v10"],
-        default="e2e_encdec_v9",
-    )
+    parser.add_argument("--model_type", choices=["e2e_encdec_v9"], default="e2e_encdec_v9")
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--num_layers", type=int, default=6)
@@ -497,7 +459,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--elementwise_attn_output_gate", type=str2bool, default=True)
     parser.add_argument("--headwise_attn_output_gate", type=str2bool, default=False)
-    parser.add_argument("--use_qk_norm", type=str2bool, default=True)
+    parser.add_argument("--use_qk_norm", type=str2bool, default=False)
     parser.add_argument("--qkv_bias", type=str2bool, default=False)
     parser.add_argument("--rms_norm_eps", type=float, default=1e-8)
     parser.add_argument("--hidden_act", type=str, default="gelu")
@@ -505,14 +467,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_rope", type=str2bool, default=True)
     parser.add_argument("--coord_dim", type=int, default=6)
     parser.add_argument("--num_attn_res_blocks", type=int, default=2)
-    parser.add_argument("--encode_observed_only", type=str2bool, default=True)
-    parser.add_argument("--use_local_query_attention", type=str2bool, default=True)
-    parser.add_argument("--query_local_k", type=int, default=8)
-    parser.add_argument("--query_local_same_time", type=str2bool, default=True)
-    parser.add_argument("--use_query_refinement", type=str2bool, default=True)
-    parser.add_argument("--refine_query_k", type=int, default=8)
-    parser.add_argument("--refine_context_k", type=int, default=16)
-    parser.add_argument("--refine_gamma_init", type=float, default=0.0)
     parser.add_argument("--use_p_scale", type=str2bool, default=False)
     parser.add_argument("--rope_freq_mode", choices=["default", "physical"], default="default")
     parser.add_argument("--lambda_phys_x", type=optional_float, default=None)

@@ -77,9 +77,9 @@ _active_metric_weights: List[float] = []
 
 KEY_COLUMNS: Tuple[str, ...] = ("shot_line", "shot_stake", "recv_line", "recv_stake")
 SORT_KEYS: List[str] = ["recv_line", "recv_stake", "shot_line", "shot_stake"]
-TRACE_SORT_KEYS: Tuple[str, ...] = ("offset", "azimuth")
+TRACE_SORT_KEYS: Tuple[str, ...] = ("rx", "ry", "sx", "sy")
 COORD_COL: Dict[str, int] = {"sx": 0, "sy": 1, "rx": 2, "ry": 3}
-METRIC_WEIGHTS: List[float] = [1.0, 1.0, 1.0, 1.0]
+METRIC_WEIGHTS: List[float] = [1.0, 1.0, 0.5, 0.5]
 
 # Convenience: the coordinate-mode byte positions (used in self_computed mode)
 BYTE_POS_SELF_COMPUTED = {

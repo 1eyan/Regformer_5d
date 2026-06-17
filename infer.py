@@ -7,7 +7,6 @@ forward pass, and accumulates predictions for query traces by SEG-Y key.
 from __future__ import annotations
 
 import json
-import inspect
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -72,28 +71,6 @@ def _repeat_trace_mask_for_chunks(mask, n_chunks: int):
     return mask.float().repeat(1, int(n_chunks))
 
 
-def _model_accepts_valid_mask(model) -> bool:
-    forward = getattr(model, "forward", None)
-    if forward is None:
-        return False
-    try:
-        return "valid_mask" in inspect.signature(forward).parameters
-    except (TypeError, ValueError):
-        return bool(getattr(model, "accepts_valid_mask", True))
-
-
-def _run_model_forward(model, x_chunk, coords_chunk, time_bounds, token_mask, valid_token):
-    if _model_accepts_valid_mask(model):
-        return model(
-            x_chunk,
-            coords_chunk,
-            time_bounds,
-            mask=token_mask,
-            valid_mask=valid_token,
-        )
-    return model(x_chunk, coords_chunk, time_bounds, mask=token_mask)
-
-
 def run_e2e_batch(
     model,
     x_norm: np.ndarray,
@@ -120,14 +97,7 @@ def run_e2e_batch(
     valid_token = _repeat_trace_mask_for_chunks(valid_mask_t, int(chunk_info["n_chunks"]))
     time_bounds = time_bounds.to(device).float() / max(float(chunk_info["time_length"]), 1.0)
     with torch.inference_mode():
-        pred_chunk = _run_model_forward(
-            model,
-            x_chunk,
-            c_chunk,
-            time_bounds,
-            token_mask,
-            valid_token,
-        )
+        pred_chunk = model(x_chunk, c_chunk, time_bounds, mask=token_mask, valid_mask=valid_token)
     pred = trace_time_unchunk(pred_chunk.detach().cpu(), chunk_info)
     if pred_clamp is not None:
         # Optional hard clamp to normalized range before inverse scaling.

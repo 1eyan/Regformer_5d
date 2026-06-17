@@ -10,7 +10,7 @@ import numpy as np
 
 def parse_metric_weights(metric_weights: Optional[Sequence[float]] = None) -> np.ndarray:
     if metric_weights is None:
-        metric_weights = [1.0, 1.0, 1.0, 1.0]
+        metric_weights = [1.0, 1.0, 0.5, 0.5]
     w = np.asarray(metric_weights, dtype=np.float64).reshape(-1)
     if w.shape[0] != 4:
         raise ValueError(f"metric_weights must have length 4, got {w.shape[0]}")

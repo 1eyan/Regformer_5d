@@ -81,11 +81,7 @@ def infer_coord_normalization_from_dataset(dataset) -> Dict[str, Any]:
     if hasattr(dataset, "coord_stats") and dataset.coord_stats:
         state["coord_stats"] = _serialize_stats(dataset.coord_stats)
         state["has_norm_coords"] = True
-        # detect per-plane unified normalization
-        if "shot_scale" in dataset.coord_stats:
-            state["coord_norm_mode"] = "per_plane_unified"
-        else:
-            state["coord_norm_mode"] = "global_minmax"
+        state["coord_norm_mode"] = "global_minmax"
         state["rope_input_coord_unit"] = "normalized"
     else:
         state["warnings"].append(
@@ -324,13 +320,8 @@ def build_rope_frequency_config(
         When ``lambda_phys_x/y`` are None, auto-computes from grid_step_*
         in coord_stats via Nyquist: lambda_min = 2 * grid_step.
 
-        For per_plane_unified normalization, omega is computed per-plane
-        (shot vs receiver) rather than per-axis (x vs y), using
-        shot_scale/recv_scale from coord_stats.
-
     Args:
         coord_stats: dict with min/max and grid_step_* per axis.
-            For per_plane_unified mode, also contains shot_scale/recv_scale.
         coord_dim: number of coordinate dimensions (4 or 6).
         n_freqs: number of frequency bands per coordinate dim.
         mode: 'default' or 'physical'.
@@ -340,7 +331,7 @@ def build_rope_frequency_config(
 
     Returns:
         dict with keys: rope_freq_mode, omega_bands (None | np.ndarray),
-        coord_dim, n_freqs, lambda_phys_x/y, omega_x/y, omega_shot/omega_recv, warnings.
+        coord_dim, n_freqs, lambda_phys_x/y, omega_x/y, warnings.
     """
     result: Dict[str, Any] = {
         "rope_freq_mode": mode,
@@ -351,8 +342,6 @@ def build_rope_frequency_config(
         "lambda_phys_y": None,
         "omega_x": None,
         "omega_y": None,
-        "omega_shot": None,
-        "omega_recv": None,
         "warnings": [],
     }
 
@@ -360,68 +349,6 @@ def build_rope_frequency_config(
         return result
 
     # ---- physical mode ----
-
-    is_per_plane = coord_stats.get("coord_norm_mode") == "per_plane_unified"
-    shot_scale = coord_stats.get("shot_scale")
-    recv_scale = coord_stats.get("recv_scale")
-
-    if is_per_plane and shot_scale is not None and recv_scale is not None:
-        # Per-plane unified: compute omega per plane
-        # L_shot = 2 * shot_scale (full range), L_recv = 2 * recv_scale
-        L_shot = max(float(shot_scale) * 2.0, 1.0)
-        L_recv = max(float(recv_scale) * 2.0, 1.0)
-
-        # lambda from grid steps (Nyquist: lambda_min = 2 * grid_step)
-        gs_sx = coord_stats.get("grid_step_sx")
-        gs_sy = coord_stats.get("grid_step_sy")
-        gs_rx = coord_stats.get("grid_step_rx")
-        gs_ry = coord_stats.get("grid_step_ry")
-
-        gs_shot = [v for v in (gs_sx, gs_sy) if v is not None and v > 0]
-        gs_recv = [v for v in (gs_rx, gs_ry) if v is not None and v > 0]
-
-        if not gs_shot:
-            result["warnings"].append(
-                "No valid grid_step_sx/sy for shot plane; falling back to default mode."
-            )
-            result["rope_freq_mode"] = "default"
-            return result
-        if not gs_recv:
-            result["warnings"].append(
-                "No valid grid_step_rx/ry for receiver plane; falling back to default mode."
-            )
-            result["rope_freq_mode"] = "default"
-            return result
-
-        lambda_shot = 2.0 * min(gs_shot) * nyquist_safety
-        lambda_recv = 2.0 * min(gs_recv) * nyquist_safety
-
-        omega_shot = math.pi * L_shot / lambda_shot
-        omega_recv = math.pi * L_recv / lambda_recv
-
-        result["omega_shot"] = omega_shot
-        result["omega_recv"] = omega_recv
-        result["lambda_phys_x"] = lambda_shot
-        result["lambda_phys_y"] = lambda_recv
-
-        # Build omega_bands: sx,sy use omega_shot; rx,ry use omega_recv
-        part_dim = 2 * n_freqs
-        base: float = 10000.0
-        bands = np.zeros((int(coord_dim), int(n_freqs)), dtype=np.float64)
-
-        omegas = [omega_shot, omega_shot, omega_recv, omega_recv]  # sx, sy, rx, ry
-        if coord_dim >= 6:
-            omegas += [omega_shot, omega_recv]  # start_time, end_time (approximate)
-
-        for i in range(int(coord_dim)):
-            o = omegas[i] if i < len(omegas) else omega_shot
-            for j in range(int(n_freqs)):
-                bands[i, j] = o / (base ** (2.0 * j / part_dim))
-
-        result["omega_bands"] = bands
-        return result
-
-    # ---- legacy per-axis mode ----
 
     # Resolve lambda from user value or auto-compute from grid steps
     _resolve_lambda(result, coord_stats, "x", lambda_phys_x, nyquist_safety)

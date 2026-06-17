@@ -49,9 +49,9 @@ def _as_float2d(x: ArrayLike, name: str) -> np.ndarray:
 
 
 def parse_metric_weights(metric_weights: Optional[Sequence[float]]) -> np.ndarray:
-    """Parse metric weights, default [1, 1, 1, 1]. Shape [4]."""
+    """Parse metric weights, default [1, 1, 0.5, 0.5]. Shape [4]."""
     if metric_weights is None:
-        metric_weights = [1.0, 1.0, 1.0, 1.0]
+        metric_weights = [1.0, 1.0, 0.5, 0.5]
     w = np.asarray(metric_weights, dtype=np.float64).reshape(-1)
     if w.shape[0] != 4:
         raise ValueError(f"metric_weights must have length 4, got {w.shape[0]}")
@@ -63,106 +63,43 @@ def parse_metric_weights(metric_weights: Optional[Sequence[float]]) -> np.ndarra
 def _normalize_minmax_neg1_to_1(coords: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     min_v = np.min(coords, axis=0)
     max_v = np.max(coords, axis=0)
-    coords_norm = _normalize_with_minmax_neg1_to_1(coords, min_v, max_v)
-    stats = _coord_stats(coords)
-    return coords_norm, stats
-
-
-def _normalize_with_minmax_neg1_to_1(
-    coords: np.ndarray,
-    min_v: np.ndarray,
-    max_v: np.ndarray,
-) -> np.ndarray:
     range_v = max_v - min_v
     safe_range = np.where(range_v > 0.0, range_v, 1.0)
     coords_norm = 2.0 * (coords - min_v) / safe_range - 1.0
-    return coords_norm.astype(np.float32)
-
-
-def _coord_stats(coords: np.ndarray) -> Dict[str, np.ndarray]:
-    return {
-        "min": np.min(coords, axis=0).astype(np.float32),
-        "max": np.max(coords, axis=0).astype(np.float32),
+    stats = {
+        "min": min_v.astype(np.float32),
+        "max": max_v.astype(np.float32),
         "mean": np.mean(coords, axis=0).astype(np.float32),
         "std": np.std(coords, axis=0).astype(np.float32),
     }
+    return coords_norm.astype(np.float32), stats
 
 
 def normalize_coords(
     coord_obs: ArrayLike,
     coord_grid: Optional[ArrayLike] = None,
 ):
-    """Per-plane unified scale normalize coordinates to [-1, 1].
-
-    Shot plane (sx, sy) and receiver plane (rx, ry) each use a single scale
-    factor (the larger range of the two axes), preserving in-plane aspect
-    ratio so that spatial distances are physically meaningful.
+    """Min-max normalize coordinates to [-1, 1] per dimension.
 
     Args:
         coord_obs: observed coordinates, shape [N_obs, 4]
         coord_grid: optional grid coordinates, shape [N_grid, 4]
 
     Returns:
-        If coord_grid is None: ``coord_obs_norm, stats``.
-        Else: ``coord_obs_norm, coord_grid_norm, stats``.
-
-        Both sides are normalized with the *grid* min/max so that the
-        coordinate frame is shared between irregular observations and the
-        regular grid.
+        If coord_grid is None: ``coord_obs_norm, stats``
+        Else: ``coord_obs_norm, coord_grid_norm, stats``
+        ``stats`` has keys ``obs`` / ``grid`` with min/max/mean/std.
     """
     coord_obs_np = _check_coord_2d(_to_numpy(coord_obs, np.float32), "coord_obs")
+    coord_obs_norm, obs_stats = _normalize_minmax_neg1_to_1(coord_obs_np)
+    stats: Dict[str, Dict[str, np.ndarray]] = {"obs": obs_stats}
 
     if coord_grid is None:
-        coord_obs_norm, obs_stats = _normalize_minmax_neg1_to_1(coord_obs_np)
-        stats: Dict[str, Dict[str, np.ndarray]] = {"obs": obs_stats}
         return coord_obs_norm, stats
 
     coord_grid_np = _check_coord_2d(_to_numpy(coord_grid, np.float32), "coord_grid")
-
-    # grid raw min-max (no clipping)
-    sx_min = float(coord_grid_np[:, 0].min())
-    sx_max = float(coord_grid_np[:, 0].max())
-    sy_min = float(coord_grid_np[:, 1].min())
-    sy_max = float(coord_grid_np[:, 1].max())
-    rx_min = float(coord_grid_np[:, 2].min())
-    rx_max = float(coord_grid_np[:, 2].max())
-    ry_min = float(coord_grid_np[:, 3].min())
-    ry_max = float(coord_grid_np[:, 3].max())
-
-    # shot plane: unified scale (preserve in-plane aspect ratio)
-    L_shot = max(sx_max - sx_min, sy_max - sy_min)
-    shot_cx = (sx_max + sx_min) / 2.0
-    shot_cy = (sy_max + sy_min) / 2.0
-    shot_scale = L_shot / 2.0 if L_shot > 0 else 1.0
-
-    # receiver plane: unified scale
-    L_recv = max(rx_max - rx_min, ry_max - ry_min)
-    recv_cx = (rx_max + rx_min) / 2.0
-    recv_cy = (ry_max + ry_min) / 2.0
-    recv_scale = L_recv / 2.0 if L_recv > 0 else 1.0
-
-    def _normalize_plane(coords: np.ndarray) -> np.ndarray:
-        return np.stack([
-            (coords[:, 0] - shot_cx) / shot_scale,
-            (coords[:, 1] - shot_cy) / shot_scale,
-            (coords[:, 2] - recv_cx) / recv_scale,
-            (coords[:, 3] - recv_cy) / recv_scale,
-        ], axis=1).astype(np.float32)
-
-    coord_obs_norm = _normalize_plane(coord_obs_np)
-    coord_grid_norm = _normalize_plane(coord_grid_np)
-
-    stats = {
-        "obs": _coord_stats(coord_obs_np),
-        "grid": _coord_stats(coord_grid_np),
-        "normalization": {
-            "shot_scale": np.float32(shot_scale),
-            "recv_scale": np.float32(recv_scale),
-            "shot_center": np.array([shot_cx, shot_cy], dtype=np.float32),
-            "recv_center": np.array([recv_cx, recv_cy], dtype=np.float32),
-            "source": np.asarray("per_plane_unified"),
-        },
-    }
+    coord_grid_norm, grid_stats = _normalize_minmax_neg1_to_1(coord_grid_np)
+    stats["grid"] = grid_stats
     return coord_obs_norm, coord_grid_norm, stats
 
 
@@ -912,7 +849,7 @@ if __name__ == "__main__":
     anchors, debug_info = facility_location_anchor_sampling(
         coord_obs=coord_obs_demo,
         num_anchors=32,
-        metric_weights=[1.0, 1.0, 1.0, 1.0],
+        metric_weights=[1.0, 1.0, 0.5, 0.5],
         sigma=None,
         k_nn_for_sigma=8,
         gain_tol=0.0,

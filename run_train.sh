@@ -14,63 +14,45 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NUM_GPUS="${NUM_GPUS:-8}"
 
 # ---- Training ----
-MODEL_TYPE="${MODEL_TYPE:-e2e_v10}"
-MODEL_NAME="${MODEL_NAME:-${MODEL_TYPE}}"
-BATCH_SIZE="${BATCH_SIZE:-20}"
+MODEL_NAME="${MODEL_NAME:-e2e_v9}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-1e-4}"
 EPOCHS="${EPOCHS:-2500}"
 SEED="${SEED:-515}"
 DATA_TYPE="${DATA_TYPE:-df_field1031_5d}"
-RESULTS_DIR="${RESULTS_DIR:-./resultsE2E_selfV2_block}"
+RESULTS_DIR="${RESULTS_DIR:-./resultsE2E_V3}"
 
 # ---- Data ----
 H5_DIR="${H5_DIR:-/data/shared/测试数据/h5}"
 H5_FILE="${H5_FILE:-${H5_DIR}/field1031_irregular.h5}"
 H5_FILE_REGULAR="${H5_FILE_REGULAR:-${H5_DIR}/field1031_label.h5}"
 H5_FILE_TGT="${H5_FILE_TGT:-}"
-DATASET_NEIGHBORS_TRAIN="${DATASET_NEIGHBORS_TRAIN:-/data/shared/测试数据/h5/anchor_patch_e2ev2/train_pool_idx_2d_block.npz}"
-# 验证集 npz，从训练路径自动推导
-_default_val_npz="${DATASET_NEIGHBORS_TRAIN/train_pool_idx_2d_block.npz/infer_query_context.npz}"
-_default_val_npz="${_default_val_npz/train_pool_idx_2d.npz/infer_query_context.npz}"
-_default_val_npz="${_default_val_npz/train_pool_idx_2d_block_orig.npz/infer_query_context.npz}"
-DATASET_NEIGHBORS_VAL="${DATASET_NEIGHBORS_VAL:-$_default_val_npz}"
-TARGET_MODE="${TARGET_MODE:-self}"
-REGULAR_HOLDOUT_NPZ="${REGULAR_HOLDOUT_NPZ:-/data/shared/测试数据/h5/anchor_patch_e2ev2/train_regular_holdout_query_context.npz}"
-REGULAR_TASK_PROB="${REGULAR_TASK_PROB:-0.4}"
+DATASET_NEIGHBORS_TRAIN="${DATASET_NEIGHBORS_TRAIN:-/data/shared/测试数据/h5/anchor_patch_e2ev1/infer_query_context.npz}"
+TARGET_MODE="${TARGET_MODE:-supervised}"
 
 # ---- Queryctx ----
-TRAIN_NUM_QUERY="${TRAIN_NUM_QUERY:-30}"
+TRAIN_NUM_QUERY="${TRAIN_NUM_QUERY:-32}"
 TRAIN_CONTEXT_SIZE="${TRAIN_CONTEXT_SIZE:-}"
 PATCH_BETA="${PATCH_BETA:-0.3}"
 FORCE_ANCHOR_QUERY="${FORCE_ANCHOR_QUERY:-false}"
-# Pool count is already very large (21,668), no need to repeat
-EPOCH_REPEAT="${EPOCH_REPEAT:-3}"
 #TRACE_SORT_KEYS="${TRACE_SORT_KEYS:-rx}"
 
 TIME_PS="${TIME_PS:-1251}"
-TRACE_PS="${TRACE_PS:-256}"
+TRACE_PS="${TRACE_PS:-128}"
 USE_P_SCALE="${USE_P_SCALE:-false}"
 CHUNK_LENGTH="${CHUNK_LENGTH:-256}"
 OVERLAP_RATIO="${OVERLAP_RATIO:-0.125}"
 QUERY_LOSS_WEIGHT="${QUERY_LOSS_WEIGHT:-1.0}"
-CONTEXT_LOSS_WEIGHT="${CONTEXT_LOSS_WEIGHT:-0.0  1}"
-ENERGY_LOSS_WEIGHT="${ENERGY_LOSS_WEIGHT:-0.5}"
+CONTEXT_LOSS_WEIGHT="${CONTEXT_LOSS_WEIGHT:-0.2}"
+ENERGY_LOSS_WEIGHT="${ENERGY_LOSS_WEIGHT:-1.0}"
 HF_GRAD_LOSS_WEIGHT="${HF_GRAD_LOSS_WEIGHT:-0.1}"
 PHASE_LOSS_WEIGHT="${PHASE_LOSS_WEIGHT:-0.1}"
-COORD_AUG_SCALE="${COORD_AUG_SCALE:-0.0}"
 
-# ---- Model ----
+# ---- V9 model ----
 D_MODEL="${D_MODEL:-768}"
 N_HEADS="${N_HEADS:-8}"
 NUM_LAYERS="${NUM_LAYERS:-6}"
 D_FF="${D_FF:-2048}"
-USE_LOCAL_QUERY_ATTENTION="${USE_LOCAL_QUERY_ATTENTION:-true}"
-QUERY_LOCAL_K="${QUERY_LOCAL_K:-8}"
-QUERY_LOCAL_SAME_TIME="${QUERY_LOCAL_SAME_TIME:-true}"
-USE_QUERY_REFINEMENT="${USE_QUERY_REFINEMENT:-true}"
-REFINE_QUERY_K="${REFINE_QUERY_K:-8}"
-REFINE_CONTEXT_K="${REFINE_CONTEXT_K:-16}"
-REFINE_GAMMA_INIT="${REFINE_GAMMA_INIT:-0.0}"
 ROPE_FREQ_MODE="${ROPE_FREQ_MODE:-physical}"
 LAMBDA_PHYS_X="${LAMBDA_PHYS_X:-auto}"
 LAMBDA_PHYS_Y="${LAMBDA_PHYS_Y:-auto}"
@@ -83,23 +65,21 @@ export SEGY_CONFIG
 echo "======================================"
 echo "E2E V9 Training — queryctx"
 echo "GPU: ${CUDA_VISIBLE_DEVICES}  |  Num: ${NUM_GPUS}"
-echo "Model: ${MODEL_NAME} (${MODEL_TYPE})  |  Batch: ${BATCH_SIZE}  |  LR: ${LR}  |  Epochs: ${EPOCHS}"
+echo "Model: ${MODEL_NAME}  |  Batch: ${BATCH_SIZE}  |  LR: ${LR}  |  Epochs: ${EPOCHS}"
 echo "H5_DIR:     ${H5_DIR}"
 echo "H5 irregular: ${H5_FILE}"
 echo "H5 regular:   ${H5_FILE_REGULAR}"
 echo "H5 target:    ${H5_FILE_TGT:-<regular>}"
 echo "neighbors:    ${DATASET_NEIGHBORS_TRAIN}"
-echo "target_mode: ${TARGET_MODE}  |  num_query: ${TRAIN_NUM_QUERY}  |  trace_ps: ${TRACE_PS}  |  beta: ${PATCH_BETA}"
-echo "epoch_repeat: ${EPOCH_REPEAT}  |  chunk_length: ${CHUNK_LENGTH}  |  overlap: ${OVERLAP_RATIO}"
+echo "target_mode: ${TARGET_MODE}  |  num_query: ${TRAIN_NUM_QUERY}  |  beta: ${PATCH_BETA}"
+echo "chunk_length: ${CHUNK_LENGTH}  |  overlap: ${OVERLAP_RATIO}"
 echo "loss: query=${QUERY_LOSS_WEIGHT} context=${CONTEXT_LOSS_WEIGHT} energy=${ENERGY_LOSS_WEIGHT} hf_grad=${HF_GRAD_LOSS_WEIGHT} phase=${PHASE_LOSS_WEIGHT}"
-echo "v10 local: attn=${USE_LOCAL_QUERY_ATTENTION} k=${QUERY_LOCAL_K} refine=${USE_QUERY_REFINEMENT} q/context=${REFINE_QUERY_K}/${REFINE_CONTEXT_K}"
 echo "rope_freq_mode: ${ROPE_FREQ_MODE}  |  lambda_x/y: ${LAMBDA_PHYS_X}/${LAMBDA_PHYS_Y}"
 echo "segy_config: ${SEGY_CONFIG}"
 echo "======================================"
 
 cmd_args=(
   --model_name "${MODEL_NAME}"
-  --model_type "${MODEL_TYPE}"
   --batch_size "${BATCH_SIZE}"
   --lr "${LR}"
   --epochs "${EPOCHS}"
@@ -112,12 +92,10 @@ cmd_args=(
   --h5File "${H5_FILE}"
   --h5File_regular "${H5_FILE_REGULAR}"
   --dataset_neighbors_train "${DATASET_NEIGHBORS_TRAIN}"
-  --dataset_neighbors_test "${DATASET_NEIGHBORS_VAL}"
   --target_mode "${TARGET_MODE}"
   --train_num_query "${TRAIN_NUM_QUERY}"
   --patch_beta "${PATCH_BETA}"
   --force_anchor_query "${FORCE_ANCHOR_QUERY}"
-  --epoch_repeat "${EPOCH_REPEAT}"
   --chunk_length "${CHUNK_LENGTH}"
   --overlap_ratio "${OVERLAP_RATIO}"
   --query_loss_weight "${QUERY_LOSS_WEIGHT}"
@@ -129,18 +107,10 @@ cmd_args=(
   --n_heads "${N_HEADS}"
   --num_layers "${NUM_LAYERS}"
   --d_ff "${D_FF}"
-  --use_local_query_attention "${USE_LOCAL_QUERY_ATTENTION}"
-  --query_local_k "${QUERY_LOCAL_K}"
-  --query_local_same_time "${QUERY_LOCAL_SAME_TIME}"
-  --use_query_refinement "${USE_QUERY_REFINEMENT}"
-  --refine_query_k "${REFINE_QUERY_K}"
-  --refine_context_k "${REFINE_CONTEXT_K}"
-  --refine_gamma_init "${REFINE_GAMMA_INIT}"
   --rope_freq_mode "${ROPE_FREQ_MODE}"
   --lambda_phys_x "${LAMBDA_PHYS_X}"
   --lambda_phys_y "${LAMBDA_PHYS_Y}"
   --rope_nyquist_safety "${ROPE_NYQUIST_SAFETY}"
-  --coord_aug_scale "${COORD_AUG_SCALE}"
   #--trace_sort_keys "${TRACE_SORT_KEYS}"
   --dataset_type queryctx
 )
@@ -151,11 +121,6 @@ fi
 
 if [[ -n "${TRAIN_CONTEXT_SIZE}" ]]; then
   cmd_args+=(--train_context_size "${TRAIN_CONTEXT_SIZE}")
-fi
-
-if [[ -n "${REGULAR_HOLDOUT_NPZ}" ]]; then
-  cmd_args+=(--regular_holdout_npz "${REGULAR_HOLDOUT_NPZ}")
-  cmd_args+=(--regular_task_prob "${REGULAR_TASK_PROB}")
 fi
 
 if [[ "${NUM_GPUS}" -gt 1 ]]; then
